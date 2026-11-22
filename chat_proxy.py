@@ -1,28 +1,10 @@
-"""
-chat_proxy.py -- Local OpenAI Chat Completions compatibility proxy for OpenCode.
+"""Combined Responses and Chat Completions gateway for OpenCode and other clients.
 
-Purpose
--------
-OpenCode providers can use either Chat Completions or Responses. This proxy
-supports both on the same port. Chat Completions requests are translated to
-AgentRouter's Responses endpoint:
-
-  1. Intercepts `POST /v1/chat/completions` (and `/chat/completions`).
-  2. Converts the request into a Responses payload built only from conversation
-     history. Nothing server-minted (`previous_response_id`, item IDs, encrypted
-     reasoning) is sent, so the cross-resource session-state errors fixed by the
-      Responses proxy cannot occur in the first place.
-  3. Converts the upstream Responses SSE stream back into Chat Completions
-     chunks, preserving streamed text, reasoning (`reasoning_content`) and tool
-     calls (`tool_calls` with incremental `function.arguments`).
-   4. Reuses the Responses proxy's transport layer (resilient DNS, shared keep-alive
-     pool, transport retries) and its pre-commit SSE priming, so early
-     `rate_limit_exceeded` / `response.failed` / empty streams are retried
-     before headers reach OpenCode.
-   5. Routes native `/v1/responses` (and `/responses`) requests through the
-       Responses proxy's recovery handler, NEVER through generic passthrough.
-   6. Runs separately from the Responses proxy: port 8789 by default
-     (`CHAT_PROXY_PORT` or `--port`).
+Primary Chat is converted to Responses and uses the shared primary recovery
+pipeline. Native Responses use that same recovery handler. Provider namespaces
+and model-prefix routing retain their separate API and credential policies.
+The default port is 8789; proxy.py provides Responses mode on 8788.
+See README.md and docs/ for desktop configuration, streaming limits, and retries.
 """
 
 from __future__ import annotations
@@ -45,6 +27,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 import proxy
 import xingchi_proxy
 import freegg_proxy
+import omniai_proxy
 
 logger = logging.getLogger("dev-api-proxy.combined")
 
@@ -53,7 +36,7 @@ DEFAULT_LISTEN_HOST = proxy.DEFAULT_LISTEN_HOST
 PORT = int(os.environ.get("CHAT_PROXY_PORT", "8789"))
 LISTEN_HOST, PORT = proxy._extract_uvicorn_bind_overrides(sys.argv, DEFAULT_LISTEN_HOST, PORT)
 
-VERSION = "1.3.1"
+VERSION = proxy.VERSION
 
 STATS: Dict[str, Any] = {
     "requests_total": 0,
@@ -713,6 +696,8 @@ async def _app_lifespan(_: FastAPI):
             LISTEN_HOST,
             PORT,
         )
+    if os.environ.get("PROXY_SUPPRESS_STARTUP_SUMMARY") != "1":
+        proxy.print_startup_summary(mode="combined", host=LISTEN_HOST, port=PORT, primary_upstream=UPSTREAM)
     try:
         yield
     finally:
@@ -722,10 +707,11 @@ async def _app_lifespan(_: FastAPI):
 
 app = FastAPI(
     title="dev-api-proxy",
-    description="Local Chat Completions and Responses compatibility proxy for OpenCode with AgentRouter, Xingchi, and FreeGG routes",
+    description="Local Chat Completions and Responses proxy for OpenCode with primary, Xingchi, FreeGG, and OmniAi routes",
     version=VERSION,
     lifespan=_app_lifespan,
 )
+app.add_middleware(proxy.ProviderModelRouter, max_body_bytes=lambda: proxy.MAX_BODY_BYTES, stats=proxy.STATS)
 app.add_middleware(
     proxy.ProxyRequestGuard, token=lambda: proxy.PROXY_AUTH_TOKEN,
     max_body_bytes=lambda: proxy.MAX_BODY_BYTES, upload_timeout_s=lambda: proxy.BODY_UPLOAD_TIMEOUT_S,
@@ -744,10 +730,15 @@ async def health():
         "proxy_auth_enabled": bool(proxy.PROXY_AUTH_TOKEN),
         "max_body_bytes": proxy.MAX_BODY_BYTES,
         "transport_recovery_wait_seconds": proxy.MAX_TRANSPORT_RECOVERY_WAIT_S,
+        "xingchi_session_filter_mode": xingchi_proxy.XINGCHI_SESSION_FILTER_MODE,
+        "provider_model_prefixes": list(proxy.PROVIDER_LABELS),
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": round(time.time() - STATS["start_time"], 1),
         "upstream": UPSTREAM,
-        "additional_upstreams": {"xingchi": xingchi_proxy.UPSTREAM, "freegg": freegg_proxy.UPSTREAM},
+        "additional_upstreams": {
+            "xingchi": xingchi_proxy.UPSTREAM, "freegg": freegg_proxy.UPSTREAM,
+            "omniai": omniai_proxy.UPSTREAM,
+        },
         "stats": STATS,
         "responses_stats": proxy.STATS,
     }
@@ -819,6 +810,7 @@ async def handle_chat_completions(request: Request):
 
 xingchi_proxy.register_routes(app, proxy)
 freegg_proxy.register_routes(app, proxy)
+omniai_proxy.register_routes(app, proxy)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
@@ -869,8 +861,4 @@ if __name__ == "__main__":
     PORT = cli_args.port
     os.environ["CHAT_PROXY_PORT"] = str(PORT)
 
-    bind_scope = "loopback only" if proxy.is_loopback_host(LISTEN_HOST) else "non-loopback -- firewall required"
-    url_host = f"[{LISTEN_HOST}]" if ":" in LISTEN_HOST and not LISTEN_HOST.startswith("[") else LISTEN_HOST
-    print(f"[*] Starting dev-api-proxy (combined) on http://{url_host}:{PORT} ({bind_scope})")
-    print(f"[*] Serving /v1/chat/completions and /v1/responses -> {UPSTREAM}/v1/responses")
     uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=600, log_level="info")

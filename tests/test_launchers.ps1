@@ -64,14 +64,20 @@ foreach ($file in @('start-proxy.ps1', 'install-autostart.ps1')) {
         $node.GetCommandName() -in @('Write-Line', 'Write-Host', 'Write-Warn')
     }, $true))
     $text = $messages.Extent.Text -join "`n"
-    if (-not $text.Contains('dev-api-proxy')) { throw "$file is missing the project display name" }
+    if ($file -eq 'install-autostart.ps1' -and -not $text.Contains('dev-api-proxy')) {
+        throw "$file is missing the project display name"
+    }
     if ($text -match '\bCodex\b') { throw "$file still has a Codex display message" }
-    if ($file -eq 'start-proxy.ps1' -and
-        -not $text.Contains('Configure OpenCode to send its AgentRouter API key in the Authorization header.')) {
-        throw 'Missing OpenCode credential guidance'
+    if ($file -eq 'start-proxy.ps1') {
+        $source = $asts[$file].Extent.Text
+        if (-not $source.Contains('proxy.print_startup_summary(')) { throw 'Missing shared startup summary' }
+        if (-not $source.Contains('PROXY_SUPPRESS_STARTUP_SUMMARY')) { throw 'Worker would print a duplicate summary' }
+        if ($source.Contains('No fallback AgentRouter API key') -or $source.Contains('OPENAI_API_KEY')) {
+            throw 'Launcher still reports unsupported or provider-specific fallback guidance'
+        }
     }
 }
-Write-Output 'Launcher OpenCode display messages OK'
+Write-Output 'Launcher provider-aware display messages OK'
 
 # Load only the configuration and health helpers. Replace network access with a local fixture.
 foreach ($name in @('Import-ProxyEnvironment', 'Get-ProbeHost', 'Get-OurProxyHealth', 'Test-OurProxy')) {

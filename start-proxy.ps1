@@ -9,7 +9,7 @@
       2. Reuses a matching proxy and reports conflicts on the requested port.
       3. Activates .venv if one is present, else falls back to system Python.
       4. Verifies fastapi / uvicorn / httpx are importable.
-      5. Verifies a credential exists WITHOUT printing it.
+      5. Loads available provider credentials without displaying their values.
       6. Starts uvicorn bound to $BindHost (default 127.0.0.1 loopback only).
 
     Usage:
@@ -53,7 +53,7 @@ $appModule = if ($Mode -eq 'combined') { 'chat_proxy:app' } else { 'proxy:app' }
 # ---------------------------------------------------------------------------
 # Logging. Console when run interactively, rotating file under -Service.
 #
-# The credential check prints only a length. Upstream error logs use basic
+# Startup diagnostics never print credentials. Upstream error logs use basic
 # credential redaction, but are not guaranteed to exclude all sensitive text.
 # ---------------------------------------------------------------------------
 $script:LogPath   = $null
@@ -113,7 +113,8 @@ function Import-ProxyEnvironment {
                 $loaded++
             }
         }
-        Write-Ok ".env loaded ($loaded variable(s) added to the environment, values not displayed)"
+        if ($Verbose_) { Write-Ok ".env loaded ($loaded variable(s) added; values not displayed)" }
+        else { Write-Ok 'Configuration loaded (.env)' }
     }
     $limit = 0L
     if (-not [long]::TryParse($bodyLimitValue, [ref]$limit) -or $limit -le 0) {
@@ -212,19 +213,20 @@ if (-not (Test-IsLoopbackHost -OnHost $BindHost) -and [string]::IsNullOrEmpty($e
     exit 1
 }
 
-Write-Step 'Locating Python interpreter'
+if ($Verbose_) { Write-Step 'Locating Python interpreter' }
 
 $venvPython = Join-Path $root '.venv\Scripts\python.exe'
 $activate   = Join-Path $root '.venv\Scripts\Activate.ps1'
 
 if (Test-Path $venvPython) {
+    $pythonSource = 'virtual environment'
     if (Test-Path $activate) {
-        try { . $activate; Write-Ok 'venv activated' }
+        try { . $activate; if ($Verbose_) { Write-Ok 'venv activated' } }
         catch { Write-Warn 'venv activation script failed; using its python.exe directly' }
     }
     $python = $venvPython
 } else {
-    Write-Warn 'no .venv found -- falling back to system Python'
+    $pythonSource = 'system'
     $python = (Get-Command python -ErrorAction SilentlyContinue).Source
     if (-not $python) { $python = (Get-Command py -ErrorAction SilentlyContinue).Source }
     if (-not $python) {
@@ -234,7 +236,7 @@ if (Test-Path $venvPython) {
 }
 
 $pyVersion = & $python --version 2>&1
-Write-Ok "interpreter: $pyVersion"
+Write-Ok "$pyVersion ($pythonSource)"
 
 if ($Update) {
     $updaterPath = Join-Path $root 'updater.py'
@@ -247,7 +249,7 @@ if ($Update) {
 # ---------------------------------------------------------------------------
 # 3. Verify dependencies
 # ---------------------------------------------------------------------------
-Write-Step 'Verifying dependencies (fastapi, uvicorn, httpx)'
+if ($Verbose_) { Write-Step 'Verifying dependencies (fastapi, uvicorn, httpx)' }
 
 $checkScript = @'
 import importlib, sys
@@ -266,7 +268,7 @@ if missing:
 $ErrorActionPreference = 'Continue'
 $depOutput = $checkScript | & $python - 2>&1
 $depExit = $LASTEXITCODE
-$depOutput | ForEach-Object { Write-Line ([string]$_) }
+if ($Verbose_ -or $depExit -ne 0) { $depOutput | ForEach-Object { Write-Line ([string]$_) } }
 
 if ($depExit -ne 0) {
     Write-Warn 'Dependencies missing -- installing from requirements.txt'
@@ -276,21 +278,19 @@ if ($depExit -ne 0) {
         Write-Err 'pip install failed. Install manually: python -m pip install -r requirements.txt'
         exit 1
     }
-    $checkScript | & $python - | ForEach-Object { Write-Line ([string]$_) }
+    $depOutput = $checkScript | & $python - 2>&1
     if ($LASTEXITCODE -ne 0) { Write-Err 'Dependencies still unavailable after install.'; exit 1 }
+    if ($Verbose_) { $depOutput | ForEach-Object { Write-Line ([string]$_) } }
 }
-Write-Ok 'all dependencies present'
+$depVersions = @($depOutput | ForEach-Object { ([string]$_).Trim() -replace '\s+', ' ' })
+Write-Ok "Dependencies ready: $($depVersions -join ', ')"
 
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# 4. Check for a credential -- never print its value
+# 4. Load user-scoped provider credentials when the process has none.
 # ---------------------------------------------------------------------------
-Write-Step 'Checking for a credential in the environment'
-
-$keyVar = $null
-$keyLen = 0
-foreach ($name in @('CODEX_GATEWAY_API_KEY', 'AGENTROUTER_API_KEY', 'OPENAI_API_KEY')) {
+foreach ($name in @('CODEX_GATEWAY_API_KEY', 'AGENTROUTER_API_KEY', 'XINGCHI_API_KEY', 'OMNIAI_API_KEY', 'FREEGG_API_KEY')) {
     $val = [Environment]::GetEnvironmentVariable($name)
     if ([string]::IsNullOrWhiteSpace($val)) {
         $val = [Environment]::GetEnvironmentVariable($name, 'User')
@@ -298,14 +298,6 @@ foreach ($name in @('CODEX_GATEWAY_API_KEY', 'AGENTROUTER_API_KEY', 'OPENAI_API_
             Set-Item -Path "Env:$name" -Value $val
         }
     }
-    if (-not [string]::IsNullOrWhiteSpace($val)) { $keyVar = $name; $keyLen = $val.Length; break }
-}
-
-if ($keyVar) {
-    Write-Ok "credential found in `$env:$keyVar (length $keyLen, value not displayed)"
-} else {
-    Write-Warn 'No fallback AgentRouter API key found in the environment.'
-    Write-Warn 'Configure OpenCode to send its AgentRouter API key in the Authorization header.'
 }
 
 # ---------------------------------------------------------------------------
@@ -318,26 +310,24 @@ try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false } c
 
 if ($Mode -eq 'combined') { $env:CHAT_PROXY_PORT = "$Port" } else { $env:PROXY_PORT = "$Port" }
 
-$upstream = $env:AGENTROUTER_UPSTREAM
-if ([string]::IsNullOrWhiteSpace($upstream)) { $upstream = 'https://agentrouter.org' }
+# Use the worker's configuration and formatter, not another copy of the banner.
+$summaryScript = @'
+import sys
+import proxy
 
-$isLoopback = Test-IsLoopbackHost -OnHost $BindHost
-$bindNote = if ($isLoopback) { '(loopback only)' } else { '(non-loopback -- firewall required!)' }
-$displayProbeHost = Get-ProbeHost -OnHost $BindHost
-$displayProbeUrl = if ($displayProbeHost -match ':' -and -not $displayProbeHost.StartsWith('[')) { "[$displayProbeHost]" } else { $displayProbeHost }
-if (-not $isLoopback) {
-    Write-Warn "Non-loopback bind enabled (${BindHost}:${Port}) -- restrict access with a firewall and avoid exposing a shared fallback API key."
+proxy.print_startup_summary(
+    mode=sys.argv[1], host=sys.argv[2], port=int(sys.argv[3]),
+    log_path=None if sys.argv[4] == '-' else sys.argv[4], control=sys.argv[5],
+)
+'@
+$summaryLog = if ($Service -or $Background) { Join-Path $root 'logs\proxy.log' } else { '-' }
+$summaryControl = if ($Background) { 'background supervisor' } else { 'Ctrl+C' }
+$summaryScript | & $python - $Mode $BindHost $Port $summaryLog $summaryControl |
+    ForEach-Object { Write-Line ([string]$_) }
+if ($LASTEXITCODE -ne 0) {
+    Write-Err 'Cannot read the proxy configuration. Correct its settings before starting.'
+    exit 1
 }
-
-Write-Line ''
-Write-Line "  dev-api-proxy ($Mode)" 'White'
-Write-Line "  upstream : $upstream"  'DarkGray'
-Write-Line "  listen   : http://${BindHost}:${Port} $bindNote" 'DarkGray'
-Write-Line "  stats    : http://${displayProbeUrl}:${Port}/_stats" 'DarkGray'
-Write-Line "  health   : http://${displayProbeUrl}:${Port}/_health" 'DarkGray'
-if ($Service) { Write-Line "  log      : $($script:LogPath) (rotates at $MaxLogKB KB)" 'DarkGray' }
-else          { Write-Line '  stop     : Ctrl+C' 'DarkGray' }
-Write-Line ''
 
 function Stop-OwnUvicorn {
     $childName = Split-Path -Leaf $python
@@ -355,13 +345,16 @@ function Stop-OwnUvicorn {
 function Invoke-Uvicorn {
     param([int]$OnPort, [string]$OnHost = '127.0.0.1')
     $savedPreference = $ErrorActionPreference
+    $savedSummaryFlag = [Environment]::GetEnvironmentVariable('PROXY_SUPPRESS_STARTUP_SUMMARY')
     $ErrorActionPreference = 'Continue'
     $script:LastUvicornExit = $null
     try {
+        $env:PROXY_SUPPRESS_STARTUP_SUMMARY = '1'
         & $python -m uvicorn $appModule --host $OnHost --port $OnPort --timeout-keep-alive 600 --log-level warning --no-access-log 2>&1 |
             ForEach-Object { Write-Line ([string]$_) }
         $script:LastUvicornExit = $LASTEXITCODE
     } finally {
+        [Environment]::SetEnvironmentVariable('PROXY_SUPPRESS_STARTUP_SUMMARY', $savedSummaryFlag)
         $ErrorActionPreference = $savedPreference
         Stop-OwnUvicorn
     }

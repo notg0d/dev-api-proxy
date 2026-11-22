@@ -5,6 +5,10 @@
 .env.*
 !.env.example
 
+# Local model metadata can contain private instructions. Do not publish it.
+/source-models.json
+/provider-picker-models.json
+
 # ---------------------------------------------------------------------------
 # Runtime output & logs
 # ---------------------------------------------------------------------------

@@ -1,0 +1,31 @@
+# Merge provider definitions into the user-level config.toml.
+# Keep root keys before the first table and use models available to your accounts.
+model = "gpt-6.1-sol"
+model_provider = "xingchi"
+
+[model_providers.xingchi]
+name = "Xingchi (local proxy)"
+base_url = "http://127.0.0.1:8789/xingchi/v1"
+wire_api = "responses"
+env_key = "XINGCHI_API_KEY"
+requires_openai_auth = false
+supports_websockets = false
+env_http_headers = { "X-Proxy-Token" = "PROXY_AUTH_TOKEN" }
+
+[model_providers.omniai]
+name = "OmniAi (local proxy)"
+base_url = "http://127.0.0.1:8789/omniai/v1"
+wire_api = "responses"
+env_key = "OMNIAI_API_KEY"
+requires_openai_auth = false
+supports_websockets = false
+env_http_headers = { "X-Proxy-Token" = "PROXY_AUTH_TOKEN" }
+
+[model_providers.freegg]
+name = "FreeGG (local proxy)"
+base_url = "http://127.0.0.1:8789/freegg/v1"
+wire_api = "responses"
+env_key = "FREEGG_API_KEY"
+requires_openai_auth = false
+supports_websockets = false
+env_http_headers = { "X-Proxy-Token" = "PROXY_AUTH_TOKEN" }

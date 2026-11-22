@@ -549,7 +549,19 @@ class ConfigurationAndServiceTests(unittest.TestCase):
             self.assertNotIn(secret, text)
 
     def test_updater_compiles_all_runtime_modules(self):
-        self.assertTrue({"proxy.py", "chat_proxy.py", "xingchi_proxy.py", "request_guard.py", "service.py", "updater.py"}.issubset(updater._CORE_PYTHON_FILES))
+        self.assertTrue({
+            "version.py", "proxy.py", "chat_proxy.py", "xingchi_proxy.py", "freegg_proxy.py",
+            "omniai_proxy.py", "provider_routing.py", "startup_status.py", "model_catalog.py",
+            "request_guard.py", "service.py", "updater.py",
+        }.issubset(updater._CORE_PYTHON_FILES))
+
+    def test_both_applications_use_the_shared_release_version(self):
+        from version import VERSION
+
+        self.assertEqual(proxy.VERSION, VERSION)
+        self.assertEqual(chat_proxy.VERSION, VERSION)
+        self.assertEqual(proxy.app.version, VERSION)
+        self.assertEqual(chat_proxy.app.version, VERSION)
 
 
 if __name__ == "__main__":

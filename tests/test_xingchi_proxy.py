@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import redirect_stdout
+import gzip
+import io
 import json
 import os
 import sys
@@ -40,6 +43,25 @@ class ByteStream(httpx.AsyncByteStream):
 
 
 class XingchiRouteTests(unittest.TestCase):
+    def test_startup_status_shows_every_upstream_and_filter_mode(self):
+        output = io.StringIO()
+        with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 2), redirect_stdout(output):
+            proxy.print_startup_summary(primary_upstream="https://primary.example")
+        status = output.getvalue()
+        self.assertIn("https://primary.example | /v1", status)
+        self.assertIn("https://api.xingchiapi.com | /xingchi/v1", status)
+        self.assertIn("https://freegg.app | /freegg/v1", status)
+        self.assertIn("https://sub.omniai.cc | /omniai/v1", status)
+        self.assertIn("session rotation every 88 requests (mode 2)", status)
+
+    def test_session_filter_status_describes_each_mode(self):
+        self.assertEqual(xingchi_proxy.session_filter_status(0), "disabled (mode 0)")
+        self.assertEqual(xingchi_proxy.session_filter_status(1), "metadata filtering (mode 1)")
+        self.assertEqual(
+            xingchi_proxy.session_filter_status(2),
+            "metadata filtering; session rotation every 88 requests (mode 2)",
+        )
+
     def test_explicit_routes_and_methods(self):
         for path in ("/xingchi/models", "/xingchi/v1/models/gpt-test", "/xingchi/usage",
                      "/xingchi/v1/sub2api/billing", "/xingchi/v1beta/models/gemini-test",
@@ -78,6 +100,47 @@ class XingchiRouteTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 xingchi_proxy._upstream_base(raw)
 
+    def test_session_filter_removes_metadata_but_preserves_conversation_content(self):
+        headers = xingchi_proxy.filter_headers({
+            "x-codex-turn-metadata": "private",
+            "x-session-id": "session-1",
+            "authorization": "Bearer provider-key",
+        }, mode=1)
+        self.assertEqual(headers, {"authorization": "Bearer provider-key"})
+        params = xingchi_proxy.filter_query_params([
+            ("prompt_cache_key", "private"), ("tag", "a"), ("tag", "b"),
+        ], mode=1)
+        self.assertEqual(params, [("tag", "a"), ("tag", "b")])
+        payload = {
+            "model": "test", "client_metadata": {"session_id": "remove"},
+            "metadata": {"session_id": "remove", "keep": True},
+            "input": [{"metadata": {"session_id": "keep conversation data"}}],
+        }
+        self.assertEqual(xingchi_proxy.filter_json_value(payload), {
+            "model": "test", "metadata": {"keep": True},
+            "input": [{"metadata": {"session_id": "keep conversation data"}}],
+        })
+
+    def test_rotation_replaces_ids_on_request_88_and_keeps_aliases_in_sync(self):
+        xingchi_proxy.reset_session_filter_state()
+        self.addCleanup(xingchi_proxy.reset_session_filter_state)
+        with patch.object(xingchi_proxy.secrets, "token_hex", return_value="rotated-session"):
+            for _ in range(xingchi_proxy.SESSION_ROTATE_AFTER - 1):
+                headers = xingchi_proxy.filter_headers({
+                    "x-session-id": "original-session", "session_id": "original-session",
+                    "x-client-request-id": "remove",
+                }, mode=2)
+                self.assertEqual(headers["x-session-id"], "original-session")
+            rotated = xingchi_proxy.filter_headers({
+                "x-session-id": "original-session", "session_id": "original-session",
+                "x-client-request-id": "remove",
+            }, mode=2)
+            self.assertEqual(rotated["x-session-id"], "rotated-session")
+            self.assertEqual(rotated["session_id"], "rotated-session")
+            self.assertNotIn("x-client-request-id", rotated)
+            continued = xingchi_proxy.filter_headers({"x-session-id": "original-session"}, mode=2)
+            self.assertEqual(continued["x-session-id"], "rotated-session")
+
 
 class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -91,6 +154,9 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         upstream_url = patch.object(xingchi_proxy, "UPSTREAM", "https://api.xingchiapi.com")
         upstream_url.start()
         self.addCleanup(upstream_url.stop)
+        filter_mode = patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 0)
+        filter_mode.start()
+        self.addCleanup(filter_mode.stop)
         env = patch.dict(os.environ, {}, clear=True)
         env.start()
         self.addCleanup(env.stop)
@@ -213,6 +279,80 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("x-proxy-token", sent.headers)
             self.assertNotIn("x-remove", sent.headers)
 
+    async def test_opt_in_filter_applies_to_xingchi_headers_query_and_json(self):
+        body = {
+            "model": "test", "client_metadata": {"installation_id": "remove"},
+            "metadata": {"session_id": "remove", "keep": "yes"},
+            "input": [{"metadata": {"session_id": "conversation-value"}}],
+        }
+        self.script.append(httpx.Response(200, json={"ok": True}))
+        with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 1):
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post(
+                    "/xingchi/responses?prompt_cache_key=private&tag=a&tag=b", json=body,
+                    headers={"x-session-id": "session-1", "x-codex-turn-metadata": "private"},
+                )
+        self.assertEqual(result.status_code, 200)
+        sent = self.calls[-1]
+        self.assertEqual(sent.url.params.get_list("tag"), ["a", "b"])
+        self.assertNotIn("prompt_cache_key", sent.url.params)
+        self.assertNotIn("x-session-id", sent.headers)
+        self.assertNotIn("x-codex-turn-metadata", sent.headers)
+        self.assertEqual(json.loads(sent.content), {
+            "model": "test", "metadata": {"keep": "yes"},
+            "input": [{"metadata": {"session_id": "conversation-value"}}],
+        })
+
+    async def test_mode_2_rotates_session_headers_before_upstream_forwarding(self):
+        xingchi_proxy.reset_session_filter_state()
+        self.addCleanup(xingchi_proxy.reset_session_filter_state)
+        self.script.append(httpx.Response(200, json={"ok": True}))
+        with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 2), \
+                patch.object(xingchi_proxy, "SESSION_ROTATE_AFTER", 1), \
+                patch.object(xingchi_proxy.secrets, "token_hex", return_value="rotated-session"):
+            async with self.client(proxy.app) as client:
+                result = await client.post("/xingchi/responses", json={"input": "hi"}, headers={
+                    "x-session-id": "original-session", "session_id": "original-session",
+                    "x-client-request-id": "remove",
+                })
+        self.assertEqual(result.status_code, 200)
+        sent = self.calls[-1]
+        self.assertEqual(sent.headers["x-session-id"], "rotated-session")
+        self.assertEqual(sent.headers["session_id"], "rotated-session")
+        self.assertNotIn("x-client-request-id", sent.headers)
+
+    async def test_filter_decodes_compressed_json_before_forwarding(self):
+        original = b'{"model":"test","client_metadata":{"session_id":"remove"},"input":"hi"}'
+        self.script.append(httpx.Response(200, json={"ok": True}))
+        with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 1):
+            async with self.client(proxy.app) as client:
+                result = await client.post(
+                    "/xingchi/responses", content=gzip.compress(original),
+                    headers={"content-type": "application/json", "content-encoding": "gzip"},
+                )
+        self.assertEqual(result.status_code, 200)
+        sent = self.calls[-1]
+        self.assertEqual(json.loads(sent.content), {"model": "test", "input": "hi"})
+        self.assertNotIn("content-encoding", sent.headers)
+
+    async def test_xingchi_chat_conversion_filters_session_metadata(self):
+        completion = {"id": "resp-1", "model": "test", "status": "completed", "output": []}
+        self.script.append(httpx.Response(200, json=completion))
+        with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 1):
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post(
+                    "/xingchi/v1/chat/completions?client_metadata=private&tag=keep",
+                    json={"model": "test", "messages": [{"role": "user", "content": "hi"}],
+                          "metadata": {"session_id": "remove", "keep": True}},
+                    headers={"x-session-id": "session-1"},
+                )
+        self.assertEqual(result.status_code, 200)
+        sent = self.calls[-1]
+        self.assertEqual(sent.url.params.get("tag"), "keep")
+        self.assertNotIn("client_metadata", sent.url.params)
+        self.assertNotIn("x-session-id", sent.headers)
+        self.assertEqual(json.loads(sent.content)["metadata"], {"keep": True})
+
     async def test_request_guard_still_applies_to_xingchi(self):
         for app in (proxy.app, chat_proxy.app):
             async with self.client(app) as client:
@@ -230,15 +370,45 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_http_errors_are_preserved_without_retries_or_cooldown(self):
         async with self.client(chat_proxy.app) as client:
-            for status in (400, 401, 403, 429, 500, 503):
+            for status in (400, 401, 403, 429, 500):
                 self.script.append(httpx.Response(status, json={"code": "API_KEY_REQUIRED", "message": "original"},
                                                  headers={"retry-after": "60"}))
                 result = await client.post("/xingchi/responses", json={"model": "test", "input": "hi"})
                 self.assertEqual(result.status_code, status)
                 self.assertEqual(result.json()["message"], "original")
                 self.assertEqual(result.headers["retry-after"], "60")
-        self.assertEqual(len(self.calls), 6)
+        self.assertEqual(len(self.calls), 5)
         self.assertEqual(proxy._RATE_LIMIT_STATE["cooldown_until"], 0)
+
+    async def test_gateway_5xx_errors_retry_and_recover(self):
+        for status in (502, 503, 504):
+            with self.subTest(status=status):
+                start = len(self.calls)
+                self.script.extend([
+                    httpx.Response(status, json={"error": {"code": "server_error", "message": "temporarily unavailable"}}),
+                    httpx.Response(200, json={"ok": True}),
+                ])
+                with patch.object(xingchi_proxy, "_wait_retry", new_callable=AsyncMock) as wait:
+                    async with self.client(chat_proxy.app) as client:
+                        result = await client.post("/xingchi/responses", json={"model": "test", "input": "hi"})
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(result.json(), {"ok": True})
+                self.assertEqual(len(self.calls), start + 2)
+                self.assertEqual(wait.await_count, 1)
+
+    async def test_maintenance_gateway_error_returns_final_response_after_bounded_retries(self):
+        status = 503
+        self.script.extend([
+            httpx.Response(status, json={"error": {"code": "server_under_maintenance", "message": "Service under maintenance"}})
+            for _ in range(xingchi_proxy.MAX_SERVER_ERROR_RETRIES + 1)
+        ])
+        with patch.object(xingchi_proxy, "_wait_retry", new_callable=AsyncMock) as wait:
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post("/xingchi/responses", json={"model": "test", "input": "hi"})
+        self.assertEqual(result.status_code, status)
+        self.assertEqual(result.json()["error"]["message"], "Service under maintenance")
+        self.assertEqual(len(self.calls), xingchi_proxy.MAX_SERVER_ERROR_RETRIES + 1)
+        self.assertEqual(wait.await_count, xingchi_proxy.MAX_SERVER_ERROR_RETRIES)
 
     async def test_transport_error_is_redacted_and_retries_are_bounded(self):
         self.script.extend([httpx.ConnectError("xingchi-secret") for _ in range(3)])
@@ -404,13 +574,17 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.content.count(b'partial'), 1)
         self.assertIn(b'upstream_stream_interrupted', result.content)
 
-    async def test_502_after_429_is_not_retried_or_logged_as_recovery(self):
-        self.script.extend([httpx.Response(429, json={}), httpx.Response(502, content=b'upstream failed')])
+    async def test_502_after_429_uses_shared_retry_budget_without_false_recovery(self):
+        self.script.extend([
+            httpx.Response(429, json={}),
+            httpx.Response(502, content=b'upstream failed'),
+            httpx.Response(502, content=b'upstream failed'),
+        ])
         with patch.object(xingchi_proxy, '_wait_retry', new_callable=AsyncMock), self.assertLogs(xingchi_proxy.logger, level='INFO') as logs:
             async with self.client(chat_proxy.app) as client:
                 result = await client.post('/xingchi/responses', json={})
         self.assertEqual(result.status_code, 502)
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 3)
         self.assertIn('[Xingchi Retry Stopped]', '\n'.join(logs.output))
         self.assertNotIn('[Xingchi Recovered]', '\n'.join(logs.output))
 

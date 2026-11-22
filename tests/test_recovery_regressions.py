@@ -257,6 +257,45 @@ class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(self.calls[start], self.calls[start + 1])
                     self.assertNotIn("broken stream", result.text)
 
+    async def test_maintenance_errors_in_200_json_and_sse_are_retried(self):
+        async def no_wait(_delay, _request):
+            return True
+
+        maintenance_json = httpx.Response(200, json={
+            "error": {"code": "temporarily_unavailable", "message": "The server is under maintenance."},
+        })
+        maintenance_sse = _sse(
+            b'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed",'
+            b'"error":{"code":"server_error","message":"Service maintenance in progress."}}}\n\n'
+        )
+
+        for stream, failure in ((False, maintenance_json), (True, maintenance_sse)):
+            with self.subTest(stream=stream):
+                proxy.reset_rate_limit_state()
+                start = len(self.calls)
+                self.script.extend([failure, _sse(COMPLETED) if stream else _complete()])
+                with patch.object(proxy, "_sleep_unless_disconnected", no_wait):
+                    result = await self.local.post(
+                        "/v1/responses", json=self.request_body("/v1/responses", stream=stream),
+                    )
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(len(self.calls), start + 2)
+                self.assertNotIn("maintenance", result.text.lower())
+
+    async def test_hard_session_request_limit_is_not_retried(self):
+        proxy.reset_rate_limit_state()
+        start = len(self.calls)
+        message = "This session has reached the limit of 100 requests. Start a new session."
+        self.script.append(httpx.Response(200, json={
+            "status": "failed", "error": {"code": "session_limit_exceeded", "message": message},
+        }))
+
+        result = await self.local.post("/v1/responses", json=self.request_body("/v1/responses"))
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(len(self.calls), start + 1)
+        self.assertIn(message, result.text)
+
     async def test_transport_recovery_deadline_does_not_reset_after_each_failure(self):
         for endpoint in ("/v1/responses", "/v1/chat/completions"):
             with self.subTest(endpoint=endpoint):

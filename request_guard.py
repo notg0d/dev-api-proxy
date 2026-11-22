@@ -14,6 +14,7 @@ from typing import Callable
 # handled locally still pass through the same method/auth/upload checks.
 POST_PATHS = frozenset({
     "/v1/responses", "/responses", "/v1/responses/compact", "/responses/compact",
+    "/v1/responses/input_tokens", "/responses/input_tokens",
     "/v1/chat/completions", "/chat/completions", "/v1/completions", "/completions",
     "/v1/messages", "/messages", "/v1/messages/count_tokens", "/messages/count_tokens",
     "/v1/embeddings", "/embeddings", "/v1/moderations", "/moderations",
@@ -25,6 +26,7 @@ POST_PATHS = frozenset({
 
 XINGCHI_PREFIX = "/xingchi"
 FREEGG_PREFIX = "/freegg"
+OMNIAI_PREFIX = "/omniai"
 FREEGG_POST_PATHS = frozenset({
     "/v1/responses", "/v1/responses/compact", "/v1/chat/completions", "/v1/completions",
     "/v1/messages", "/v1/embeddings", "/v1/moderations", "/v1/rerank",
@@ -81,9 +83,18 @@ _XINGCHI_GEMINI_ACTIONS = frozenset({"generateContent", "streamGenerateContent",
 
 def xingchi_upstream_path(path: str) -> str:
     """Map only the fixed Xingchi namespace; unversioned aliases use /v1."""
-    if not path.startswith(XINGCHI_PREFIX + "/"):
+    return _sub2api_upstream_path(path, XINGCHI_PREFIX)
+
+
+def omniai_upstream_path(path: str) -> str:
+    """Map the isolated OmniAi namespace to the Sub2API gateway routes."""
+    return _sub2api_upstream_path(path, OMNIAI_PREFIX)
+
+
+def _sub2api_upstream_path(path: str, prefix: str) -> str:
+    if not path.startswith(prefix + "/"):
         return ""
-    codex_prefix = XINGCHI_PREFIX + "/codex/"
+    codex_prefix = prefix + "/codex/"
     if path.startswith(codex_prefix):
         # Map /xingchi/codex[/v1]/... to the upstream Sub2API-compatible
         # /backend-api/codex/... path without exposing an arbitrary proxy.
@@ -91,15 +102,19 @@ def xingchi_upstream_path(path: str) -> str:
         if relative.startswith("v1/"):
             relative = relative[3:]
         return "/backend-api/codex/" + relative
-    upstream_path = path[len(XINGCHI_PREFIX):]
+    upstream_path = path[len(prefix):]
     if not upstream_path.startswith(("/v1/", "/v1beta/", "/antigravity/", "/backend-api/codex/")):
         upstream_path = "/v1" + upstream_path
     return upstream_path
 
 
 def _xingchi_allowed_methods(path: str) -> frozenset[str]:
-    upstream_path = xingchi_upstream_path(path)
-    if path.startswith(XINGCHI_PREFIX + "/codex/") and upstream_path in XINGCHI_CODEX_CHAT_PATHS:
+    return _sub2api_allowed_methods(path, XINGCHI_PREFIX)
+
+
+def _sub2api_allowed_methods(path: str, prefix: str) -> frozenset[str]:
+    upstream_path = _sub2api_upstream_path(path, prefix)
+    if path.startswith(prefix + "/codex/") and upstream_path in XINGCHI_CODEX_CHAT_PATHS:
         return frozenset({"POST"})
     if upstream_path in XINGCHI_GET_PATHS:
         return frozenset({"GET"})
@@ -120,6 +135,8 @@ def _xingchi_allowed_methods(path: str) -> frozenset[str]:
 
 
 def allowed_methods(path: str) -> frozenset[str]:
+    if path.startswith(OMNIAI_PREFIX + "/"):
+        return _sub2api_allowed_methods(path, OMNIAI_PREFIX)
     if path.startswith(FREEGG_PREFIX + "/"):
         return _freegg_allowed_methods(path)
     if path.startswith(XINGCHI_PREFIX + "/"):

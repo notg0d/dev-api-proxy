@@ -1,24 +1,10 @@
-"""
-proxy.py -- Local OpenAI Responses API compatibility proxy for OpenCode and AgentRouter.
+"""Local Responses gateway for OpenCode and other compatible clients.
 
-Purpose
--------
-When using OpenCode or another Responses client with AgentRouter, multi-turn sessions can fail with:
-"OpenAI Responses bad request: The requested item was created under a different
-**** OpenAI resource. Use the same resource that created the item to access it."
-
-This proxy recovers requests that include replayable conversation history by:
-  1. Intercepting requests to `/v1/responses` (and `/responses`).
-  2. Providing resilient DNS resolution with static fallback IPs (8.214.160.125 / 8.214.161.192)
-     so local network DNS drops or rate-limits never cause [Errno 11001] getaddrinfo failed.
-  3. Reusing persistent HTTP keep-alive connection pools to minimize connection overhead and
-     eliminate redundant DNS queries.
-  4. Automatic transport-level retries on transient connection or server disconnect errors.
-  5. Attempting the original request transparently first to leverage upstream KV cache.
-  6. When an upstream resource mismatch or state error occurs (HTTP 400), activating a
-      recovery phase with a sanitized stateless payload (stripping previous_response_id,
-     server-minted item IDs, and un-decryptable reasoning tokens).
-  7. Streaming SSE events (`text/event-stream`) directly to the client once upstream commits.
+Primary requests use bounded recovery, supplied-history sanitization, and SSE
+inspection. Native Xingchi, OmniAi, and FreeGG relays retain their own policy.
+The request guard and model-prefix router run before upstream work. Individual
+responses own connection cleanup; retries never replay committed output.
+See README.md and docs/ for setup, limits, credential rules, and validation.
 """
 
 from __future__ import annotations
@@ -49,6 +35,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from request_guard import ProxyRequestGuard
+from provider_routing import ProviderModelRouter, PROVIDER_LABELS
+from startup_status import build_summary
+from version import VERSION
 
 # ----------------------------------------------------------------------------
 # Logging Setup
@@ -61,7 +50,7 @@ logging.basicConfig(
 logger = logging.getLogger("dev-api-proxy.responses")
 
 # ----------------------------------------------------------------------------
-# Resilient DNS Resolver (Fixes [Errno 11001] getaddrinfo failed permanently)
+# DNS resolution with known-host fallback, not an availability guarantee.
 # ----------------------------------------------------------------------------
 _ORIG_GETADDRINFO = socket.getaddrinfo
 
@@ -76,7 +65,7 @@ DYNAMIC_DNS_CACHE: Dict[str, List[tuple]] = {}
 
 def resilient_getaddrinfo(host, port, *args, **kwargs):
     """
-    Bulletproof getaddrinfo hook:
+    Known-host getaddrinfo fallback:
     1. Attempts standard OS getaddrinfo first.
     2. On success, updates DYNAMIC_DNS_CACHE.
     3. On failure (socket.gaierror), falls back to DYNAMIC_DNS_CACHE or STATIC_DNS_FALLBACKS.
@@ -211,9 +200,10 @@ def _load_env():
 
 _load_env()
 
-# Xingchi configuration must see the same .env values as the main proxy.
+# Native provider configuration must see the same .env values as the main proxy.
 import xingchi_proxy
 import freegg_proxy
+import omniai_proxy
 
 UPSTREAM = os.environ.get("AGENTROUTER_UPSTREAM", "https://agentrouter.org").rstrip("/")
 DEFAULT_LISTEN_HOST = "127.0.0.1"
@@ -361,6 +351,7 @@ HOP_BY_HOP = frozenset({
     "content-length",
     "accept-encoding",
     "x-proxy-token",  # Local authentication must never reach an upstream server.
+    "x-proxy-model-routing",  # Local picker protocol marker, not an upstream header.
 })
 
 STRIP_RESPONSE_HEADERS = HOP_BY_HOP | {"content-encoding", "date"}
@@ -378,6 +369,10 @@ TRANSIENT_ERROR_CODES = RATE_LIMIT_CODES | frozenset({
     "server_error",
     "overloaded",
     "service_unavailable",
+    "maintenance",
+    "maintenance_mode",
+    "server_under_maintenance",
+    "service_under_maintenance",
     "upstream_error",
     "timeout",
     "internal_error",
@@ -392,7 +387,8 @@ RATE_LIMIT_TEXT_RE = re.compile(
 )
 
 TRANSIENT_CAPACITY_TEXT_RE = re.compile(
-    r"overloaded|temporarily unavailable|capacity|high demand|try again in|server had an error|bad gateway|gateway timeout",
+    r"overloaded|temporarily unavailable|under maintenance|maintenance mode|maintenance window|"
+    r"\bmaintenance\b|capacity|high demand|try again in|server had an error|bad gateway|gateway timeout",
     re.IGNORECASE,
 )
 
@@ -794,6 +790,7 @@ def redact_sensitive(text: str) -> str:
         os.environ.get("AGENTROUTER_API_KEY"), os.environ.get("CODEX_AGENTROUTER_GATEWAY_KEY"),
         os.environ.get("XINGCHI_API_KEY"),
         os.environ.get("FREEGG_API_KEY"),
+        os.environ.get("OMNIAI_API_KEY"),
     ):
         if secret:
             text = text.replace(secret, "[redacted]")
@@ -1026,6 +1023,30 @@ async def _read_and_close_response(resp: httpx.Response, request: Optional[Reque
 # ----------------------------------------------------------------------------
 # FastAPI Application
 # ----------------------------------------------------------------------------
+def print_startup_summary(
+    *, mode: str = "responses", host: str | None = None, port: int | None = None,
+    primary_upstream: str | None = None, log_path: str | None = None, control: str = "Ctrl+C",
+) -> None:
+    """Show the actual provider routes, limits, and credential sources without keys."""
+    primary_fallback = any(os.environ.get(name) for name in ("CODEX_GATEWAY_API_KEY", "AGENTROUTER_API_KEY"))
+    providers = (
+        ("Primary", primary_upstream or UPSTREAM, "/v1", primary_fallback),
+        ("Xingchi", xingchi_proxy.UPSTREAM, "/xingchi/v1", bool(os.environ.get("XINGCHI_API_KEY"))),
+        ("OmniAi", omniai_proxy.UPSTREAM, "/omniai/v1", bool(os.environ.get("OMNIAI_API_KEY"))),
+        ("FreeGG", freegg_proxy.UPSTREAM, "/freegg/v1", bool(os.environ.get("FREEGG_API_KEY"))),
+    )
+    lines = build_summary(
+        mode=mode, host=host or LISTEN_HOST, port=PORT if port is None else port, providers=providers,
+        session_filter="session filter: " + xingchi_proxy.session_filter_status(),
+        auth_enabled=bool(PROXY_AUTH_TOKEN), max_body_bytes=MAX_BODY_BYTES,
+        max_sse_frame_bytes=MAX_SSE_FRAME_BYTES, connect_timeout_s=CONNECT_TIMEOUT_S,
+        read_timeout_s=READ_TIMEOUT_S, log_path=log_path, control=control,
+        version=VERSION,
+    )
+    for line in lines:
+        print(line, flush=True)
+
+
 @asynccontextmanager
 async def _app_lifespan(_: FastAPI):
     if not is_loopback_host(LISTEN_HOST) and not PROXY_AUTH_TOKEN:
@@ -1037,6 +1058,8 @@ async def _app_lifespan(_: FastAPI):
             LISTEN_HOST,
             PORT,
         )
+    if os.environ.get("PROXY_SUPPRESS_STARTUP_SUMMARY") != "1":
+        print_startup_summary()
     try:
         yield
     finally:
@@ -1047,10 +1070,11 @@ async def _app_lifespan(_: FastAPI):
 
 app = FastAPI(
     title="dev-api-proxy",
-    description="Local Responses compatibility proxy for OpenCode with AgentRouter recovery and native Xingchi and FreeGG routes",
-    version="1.7.0",
+    description="Local Responses proxy for OpenCode with primary-upstream recovery and native Xingchi, FreeGG, and OmniAi routes",
+    version=VERSION,
     lifespan=_app_lifespan,
 )
+app.add_middleware(ProviderModelRouter, max_body_bytes=lambda: MAX_BODY_BYTES, stats=STATS)
 app.add_middleware(
     ProxyRequestGuard, token=lambda: PROXY_AUTH_TOKEN, max_body_bytes=lambda: MAX_BODY_BYTES,
     upload_timeout_s=lambda: BODY_UPLOAD_TIMEOUT_S, stats=STATS,
@@ -1090,17 +1114,22 @@ async def health():
     return {
         "status": "ok",
         "proxy": "dev-api-proxy",
-        "version": "1.7.0",
+        "version": VERSION,
         "supported_apis": ["responses"],
         "proxy_auth_enabled": bool(PROXY_AUTH_TOKEN),
         "max_body_bytes": MAX_BODY_BYTES,
         "transport_recovery_wait_seconds": MAX_TRANSPORT_RECOVERY_WAIT_S,
         "dns_fallback_active": True,
         "max_images_per_request": MAX_IMAGES_PER_REQUEST,
+        "xingchi_session_filter_mode": xingchi_proxy.XINGCHI_SESSION_FILTER_MODE,
+        "provider_model_prefixes": list(PROVIDER_LABELS),
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": uptime_s,
         "upstream": UPSTREAM,
-        "additional_upstreams": {"xingchi": xingchi_proxy.UPSTREAM, "freegg": freegg_proxy.UPSTREAM},
+        "additional_upstreams": {
+            "xingchi": xingchi_proxy.UPSTREAM, "freegg": freegg_proxy.UPSTREAM,
+            "omniai": omniai_proxy.UPSTREAM,
+        },
         "stats": STATS,
     }
 
@@ -2076,6 +2105,7 @@ async def recover_responses_request(
 
 xingchi_proxy.register_routes(app, sys.modules[__name__])
 freegg_proxy.register_routes(app, sys.modules[__name__])
+omniai_proxy.register_routes(app, sys.modules[__name__])
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])
@@ -2132,8 +2162,4 @@ if __name__ == "__main__":
     PORT = cli_args.port
     os.environ["PROXY_PORT"] = str(PORT)
 
-    bind_scope = "loopback only" if is_loopback_host(LISTEN_HOST) else "non-loopback -- firewall required"
-    url_host = f"[{LISTEN_HOST}]" if ":" in LISTEN_HOST and not LISTEN_HOST.startswith("[") else LISTEN_HOST
-    print(f"[*] Starting dev-api-proxy (responses) on http://{url_host}:{PORT} ({bind_scope})")
-    print(f"[*] Forwarding to upstream: {UPSTREAM}")
     uvicorn.run(app, host=LISTEN_HOST, port=PORT, timeout_keep_alive=600, log_level="info")

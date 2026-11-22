@@ -1,133 +1,197 @@
 # Transport reliability
 
-The proxy can recover from some temporary upstream failures. It cannot guarantee network availability or exactly-once model execution.
+The proxy recovers from selected temporary failures. It cannot guarantee availability, capacity, or exactly-once model execution.
+A retry after accepted work can cause duplicate execution or additional charges.
 
-## Recovery rules
+## Recovery matrix
 
-- Responses and translated Chat requests use one outer retry loop and one shared retry count.
-- The transport helper sends one attempt per outer iteration.
-- Generic API forwarding permits two transport attempts, including the initial attempt.
-- Connection and read timeouts remain unchanged. `PROXY_MAX_TRANSIENT_RETRIES` still limits the total transient retry count.
-- `PROXY_MAX_TRANSPORT_RECOVERY_WAIT_S` sets a separate transport recovery window. It defaults to 90 seconds.
-- This window starts at the first retryable transport failure. Repeated failures do not reset it.
-- The initial connection or response-header wait does not consume the transport recovery window.
-- `PROXY_MAX_RATE_LIMIT_WAIT_S` still controls rate-limit and server-error recovery from the initial request launch.
-- Shared cooldowns remain in effect. HTTP errors cannot start a fresh transport recovery window.
-- These windows limit retry delays and new attempt launches. They do not cancel an in-flight attempt at expiry.
-- Known authentication, billing, quota, invalid-input, and content-policy errors do not receive automatic retries.
-- Read and write failures can occur after an upstream accepts work. Automatic retries can produce duplicate work or additional charges.
-- `PROXY_RETRY_AMBIGUOUS_ERRORS=0` disables retries for ambiguous transport errors, empty streams, and initial SSE timeouts.
-- `PROXY_RETRY_ON_5XX=0` disables retries for upstream server errors.
-- Initial Server-Sent Events (SSE) use a bounded inspection buffer before the proxy sends response headers downstream.
-- After downstream response headers, the proxy does not replay the request, partial output, or tool calls.
+| Path | Retry owner | Default limit | Initial SSE inspection |
+| --- | --- | --- | --- |
+| Primary Responses and primary Chat in combined mode | Shared primary recovery loop | Six transient retries; separate bounded resource-mismatch fallback | Yes |
+| Native Xingchi, OmniAi, and FreeGG relays | Native relay loop | Two retries within eight seconds from first eligible failure | No |
+| Converted Xingchi/FreeGG Chat and Codex-facade Chat | Transport helper | Two transport attempts total | No |
+| Generic primary forwarding | Transport helper | Two transport attempts total | No; response is buffered |
 
-These options do not provide an exactly-once guarantee. TCP keep-alive and downstream SSE heartbeats cannot repair an upstream outage.
+Provider-qualified models use the selected relay's policy after dispatch.
+The router itself adds no network retry layer.
+After client response headers, no path automatically replays the request, delivered text, or tool calls.
 
-### Same-session error guidance
+## Primary recovery
 
-When transport recovery stops, HTTP `502` includes `upstream_transport_retries_exhausted` and the failure cause.
-With automatic transport retries disabled, the code is `upstream_transport_error`.
-Both errors explain that a retry can use the same client session.
-The proxy does not read or change local session data.
+Native primary Responses and translated primary Chat share one outer transient retry count.
+Each outer iteration sends one transport attempt.
+This avoids multiplying application and transport retry counts.
 
-Content-policy rejections remain non-retryable.
-Before client response headers, the proxy preserves upstream error fields and adds `retryable: false` and guidance.
-It includes a request ID when the upstream error or headers supply one.
-Non-`200` upstream HTTP statuses remain unchanged.
-Initial HTTP `200` JSON or SSE content rejections become HTTP `400`, not a successful completion or temporary HTTP `502`.
-After client response headers, the proxy forwards upstream errors without replaying the request.
-It never activates history sanitization for a content-policy rejection.
+`PROXY_MAX_RATE_LIMIT_WAIT_S` defaults to 90 seconds from the first request launch.
+It bounds HTTP rate-limit and server-error recovery waits and new launches.
+`PROXY_MAX_TRANSPORT_RECOVERY_WAIT_S` defaults to 90 seconds from the first eligible transport failure.
+A slow initial connection or header wait does not consume that separate transport window.
+Repeated transport failures do not reset it.
+Shared rate-limit cooldowns remain in effect during transport recovery.
+Neither window cancels an in-flight model generation when its deadline expires.
 
-Content-rejection logs contain counts and an available request ID, not prompts, image URLs, or quoted error content.
-The proxy cannot identify which content caused a generic rejection.
+Eligible failures include rate limits and configured temporary `408`, `500`, `502`, `503`, or `504` errors.
+The pipeline can also inspect eligible JSON and SSE failures delivered with HTTP `200`.
+Maintenance-related codes or error text can receive pre-commit transient recovery.
 
-## Disconnects and connection ownership
+Known permanent authentication, quota, billing, invalid-input, and content-policy errors do not activate transient recovery.
+Unknown provider error codes are not guaranteed to be classified correctly by a broad HTTP status alone.
 
-The proxy watches downstream disconnects during connection setup, header waits, buffered body reads, and retry delays.
-A downstream disconnect cancels pending upstream work. It does not count as a transport failure that needs another attempt.
-The application returns status `499` internally. A disconnected client usually cannot receive that response.
-Cancellation does not prove that the upstream stopped generation or cancelled billing.
+### Resource-specific state
 
-Each streaming HTTP response owns its upstream response and producer task.
-Cleanup closes the iterator, cancels and joins the producer, and closes the upstream response.
-Cleanup also runs if downstream transmission fails before the first output byte or while the iterator is suspended.
-Cleanup uses a cancellation shield so a cancelled application scope cannot skip connection release.
-A cleanup exception does not replace the original failure or trigger a retry of completed work.
+A recognized resource mismatch can activate stateless fallback using supplied conversation history.
+Fallback removes incompatible response references, item IDs, reasoning state, and encrypted content.
+It keeps function `call_id` links and applies the primary image cap.
+The mismatch fallback has a separate bounded count from transient retries.
 
-The proxy does not close the entire shared client after an individual transport failure.
-HTTPcore already removes failed, closed, and expired connections.
-A global client reset can interrupt unrelated streams. A failure on a new connection also does not establish stale-pool trouble.
+The proxy cannot fetch missing history from IDs or decrypt a foreign compaction checkpoint.
+Insufficient replayable history returns `recovery_history_missing`.
+Policy rejections never activate this sanitization.
+Native provider relays and converted provider Chat do not use primary history recovery or image pruning.
 
-## Error diagnostics
+## Native relay recovery
 
-An attempt log can include:
+Native relays retry eligible HTTP `429`, `500`, `502`, `503`, and `504` responses and pre-header transport failures.
+They share one retry counter and one eight-second recovery deadline.
+The deadline starts with the first eligible failure, not the initial request launch.
+
+Retries honor `Retry-After` seconds, HTTP dates, and `retry-after-ms`.
+Calculated delays use exponential backoff and jitter.
+An upstream hint longer than the remaining window is not shortened.
+For example, a 40-second hint returns the latest error without a premature retry.
+
+Known permanent quota, authentication, and policy errors are returned without another attempt.
+Native response-body failures and already committed SSE do not enter the native retry loop.
+The latest HTTP error body, status, and eligible headers are preserved when recovery stops.
+Native retries do not start the primary shared cooldown.
+
+## Provider Chat conversion
+
+Xingchi and FreeGG Chat requests are converted to Responses for compatibility.
+The Codex facades also use direct conversion.
+They can use one transport retry, not the native relay's HTTP retry window.
+
+Non-streaming conversion uses the helper's buffered read; an eligible ambiguous failure can repeat that attempt.
+Once an SSE conversion is handed to the downstream response, it does not receive pre-commit retry inspection.
+Initial and later SSE errors are translated to client errors, not hidden by another request.
+HTTP errors are preserved without native HTTP retry recovery in this conversion path.
+
+## Conservative retry settings
+
+```dotenv
+PROXY_RETRY_ON_5XX=0
+PROXY_RETRY_AMBIGUOUS_ERRORS=0
+```
+
+The first setting disables eligible server-error recovery.
+The second disables ambiguous transport recovery and primary empty/stalled pre-commit stream recovery.
+Connection and pool failures, rate limits, and resource mismatches can still use their applicable recovery paths.
+These settings do not provide an exactly-once guarantee.
+
+## Streams and connection ownership
+
+Primary SSE inspection has separate frame and pre-commit byte limits.
+The defaults are 8 MiB per frame and 8 MiB for the primed buffer.
+Output, hosted-tool activity, a terminal event, or the setup grace period can end inspection.
+No-replay protection applies after response commitment, even if the stream later fails.
+
+Native streams keep their provider formats and relay frames incrementally.
+Valid terminal events close the upstream even when the server keeps the connection open.
+Gemini can deliver usage after a candidate finish reason, so that event does not immediately stop its relay.
+Truncation without a terminal event produces `upstream_stream_interrupted`, not a fabricated success.
+Oversized frames produce `upstream_sse_frame_too_large` without replay.
+An oversized primary initial buffer produces `upstream_sse_prime_too_large`.
+
+Each streaming response owns its iterator, upstream response, and any producer task.
+Cleanup runs after normal completion, cancellation, and downstream transmission failure.
+It cancels and joins producers and releases the response under a cancellation shield.
+Cleanup errors do not replace the original error or retry completed work.
+
+An individual failure does not reset the entire shared HTTPX client.
+HTTPcore removes failed, closed, and expired pool connections.
+A global client reset could interrupt unrelated streams.
+
+## Disconnects
+
+The proxy watches disconnects during sends, header waits, buffered reads, and retry delays.
+A disconnect cancels pending work without another attempt.
+Internal status `499` records cancellation; the disconnected client may not receive it.
+Cancellation does not prove the upstream stopped generation or billing.
+Model-prefix routing retains the original disconnect channel instead of replacing it with a dead receiver.
+
+## Diagnostics and error guidance
+
+An attempt can report a bounded explicit cause chain:
 
 ```text
 ReadError (caused by BrokenResourceError -> ConnectionResetError: [Errno 10054] Connection reset by peer) (phase=response_headers elapsed=42.30s connection=new)
 ```
 
-This is an example, not proof that every read failure has this cause.
+This is an example, not a diagnosis for every read failure.
 
 | Field | Meaning |
 | --- | --- |
-| `ConnectError` | TCP connection or TLS setup failed. The cause can identify DNS, socket, or certificate trouble. |
-| `ReadError` | A network read failed. This is different from a read timeout. |
-| `phase` | The latest relevant HTTPcore operation, such as `connect_tcp`, `tls_handshake`, `response_headers`, or `response_body`. |
-| `elapsed` | Time since the attempt started, not time in the reported phase alone. |
-| `connection=new` | The trace recorded TCP or TLS setup for this attempt. |
-| `connection=reused` | An HTTP operation started without a connection-setup trace. |
-| `http_status` | The upstream status, when response headers arrived. |
+| Exception type | Failure category; an unavailable cause remains unavailable |
+| `phase` | Latest relevant HTTPcore operation, not proof of its exact duration |
+| `elapsed` | Time since the attempt started |
+| `connection=new` | TCP or TLS setup was recorded |
+| `connection=reused` | An HTTP operation began without a connection-setup trace |
+| `http_status` | Upstream status, if headers arrived |
 
-HTTPcore can clear an explicit exception cause when it re-raises an error during pool or stream cleanup.
-The proxy captures explicit causes from supported trace `.failed` events before that cleanup.
-It stores bounded, redacted strings on the affected exception. It does not retain trace headers, bodies, or additional exception objects.
-These strings remain available after HTTPX wraps the error and during later stream reads.
-An unavailable cause remains unavailable. The proxy does not infer one from an exception name.
+The supported trace hook captures safe explicit cause strings before HTTPcore can suppress them during cleanup.
+It does not retain request headers, bodies, or additional exception objects.
+Several retry lines can belong to concurrent requests, each with its own counter.
+A recovered-response log does not prove stream completion or client task success.
 
-Several retry lines can belong to concurrent requests. Each request has its own counter.
-`[Success] Request recovered` means the proxy obtained a usable response. It does not prove the stream or client task completed.
+Primary transport exhaustion returns `upstream_transport_retries_exhausted` and same-session retry guidance.
+With recovery disabled, it uses `upstream_transport_error`.
+These errors do not require deleting or recreating the client session.
 
-## Source comparison
+### Content policy
 
-The comparison uses fixed source revisions inspected on November 14–15, 2026.
-The table describes relevant implementation behavior, not every feature or deployment of each project.
+Primary pre-commit policy rejections preserve upstream fields and add non-retryable guidance and an available request ID.
+Non-`200` upstream statuses remain unchanged.
+A primary HTTP `200` JSON/SSE policy rejection becomes `400` before client headers.
+After commitment, the error continues through the stream without replay.
+Content-rejection diagnostics use counts rather than prompts or image URLs.
+Other upstream error messages can quote private content; review logs before sharing them.
 
-| Source | Relevant behavior | Application here |
-| --- | --- | --- |
-| [LiteLLM HTTP handler](https://github.com/BerriAI/litellm/blob/ec48e2491c5132951cd2710671506019ce93f0a0/litellm/llms/custom_httpx/http_handler.py#L996-L1050) | Some `ConnectError` paths retry with a new client. The shown path closes that client in `finally`. | Do not copy this stream lifetime into the proxy. Keep a streamed response open until its consumer finishes. |
-| [CLIProxyAPI Codex stream](https://github.com/router-for-me/CLIProxyAPI/blob/bd9c766f34840b050b01cbdafad7cf29b3cb151f/internal/runtime/executor/codex_executor_stream.go#L164-L229) | Optional bootstrap inspection has time, frame, and byte limits. [Cancellation guards](https://github.com/router-for-me/CLIProxyAPI/blob/bd9c766f34840b050b01cbdafad7cf29b3cb151f/internal/runtime/executor/codex_executor_stream.go#L387-L400) separate downstream cancellation from upstream failure. | Retain bounded initial inspection. Cancel abandoned operations without another upstream attempt. |
-| [CLIProxyAPI transport cache](https://github.com/router-for-me/CLIProxyAPI/blob/bd9c766f34840b050b01cbdafad7cf29b3cb151f/internal/runtime/executor/helps/transport_cache.go#L155-L159) | Cache removal closes idle connections without closing active requests. | Do not reset the whole shared client to address one failure. |
-| [New API HTTP client](https://github.com/QuantumNous/new-api/blob/b388140acfd80369ec6243b16869daff1b4051f4/service/http_client.go#L79-L125) | Configurable connection limits, idle expiry, and response-header timeout bound transport use. | Existing HTTPX connect, read, write, and pool timeouts remain in effect. Do not increase timeouts as a proposed cure for `ReadError`. |
-| [Portkey retry handler](https://github.com/Portkey-AI/gateway/blob/669825cbe89ee51569918b8f78a9db486fd69dd4/src/handlers/retryHandler.ts) | Uses bounded retries and a timeout-driven abort controller. | Preserve bounded retries and release abandoned upstream operations. Do not add another retry layer. |
-| [OpenAI Python client](https://github.com/openai/openai-python/blob/3dae6090cc31cc64a437fe0bcee740b6d81ed2cc/src/openai/_base_client.py) | Uses retry classification, backoff, jitter, and retry-delay hints. | Retain existing permanent-error classification and provider delay hints. |
-| [HTTPX transport documentation](https://github.com/encode/httpx/blob/b5addb64f0161ff6bfe94c124ef76f6a1fba5254/docs/advanced/transports.md) | Built-in transport retries cover connection errors and connection timeouts, not general read failures. | The application recovery loop owns read-failure policy and the total retry count. |
-| [HTTPcore pool cleanup](https://github.com/encode/httpcore/blob/10a658221deb38a4c5b16db55ab554b0bf731707/httpcore/_async/connection_pool.py#L248-L299) and [trace events](https://github.com/encode/httpcore/blob/10a658221deb38a4c5b16db55ab554b0bf731707/httpcore/_trace.py#L95-L107) | Pool cleanup uses `raise exc from None`. Trace failure events expose the error earlier. Stream cleanup has the same cause-loss mechanism. | Capture safe cause strings before cleanup. Use the supported trace extension, not an HTTPcore patch. |
+### Upload limits and maintenance
 
-Static IP changes, disabled TLS verification, unlimited retries, and global client resets are not general remedies.
-Endpoint failover needs evidence that an endpoint is consistently unavailable. A successful small request does not exclude intermittent failures.
+Local `413` comes from a configured request-size check.
+Upstream `413` means the service rejected the body; changing the local limit cannot change that service's limit.
+Maintenance recovery can retry temporary failures but cannot repair the upstream or guarantee eventual availability.
 
-## Tests
+## Design references
 
-Run all tests from the repository root:
+These fixed source revisions informed the existing transport design in November 2026.
+They are implementation references, not claims about every current deployment.
+
+| Reference | Relevant topic |
+| --- | --- |
+| [LiteLLM HTTP handler](https://github.com/BerriAI/litellm/blob/ec48e2491c5132951cd2710671506019ce93f0a0/litellm/llms/custom_httpx/http_handler.py#L996-L1050) | Client and stream lifetime |
+| [CLIProxyAPI stream](https://github.com/router-for-me/CLIProxyAPI/blob/bd9c766f34840b050b01cbdafad7cf29b3cb151f/internal/runtime/executor/codex_executor_stream.go#L164-L229) | Bounded bootstrap inspection and cancellation |
+| [CLIProxyAPI transport cache](https://github.com/router-for-me/CLIProxyAPI/blob/bd9c766f34840b050b01cbdafad7cf29b3cb151f/internal/runtime/executor/helps/transport_cache.go#L155-L159) | Idle versus active connection cleanup |
+| [New API HTTP client](https://github.com/QuantumNous/new-api/blob/b388140acfd80369ec6243b16869daff1b4051f4/service/http_client.go#L79-L125) | Pool and timeout limits |
+| [Portkey retry handler](https://github.com/Portkey-AI/gateway/blob/669825cbe89ee51569918b8f78a9db486fd69dd4/src/handlers/retryHandler.ts) | Bounded retry policy |
+| [OpenAI Python client](https://github.com/openai/openai-python/blob/3dae6090cc31cc64a437fe0bcee740b6d81ed2cc/src/openai/_base_client.py) | Retry classification and delay hints |
+| [HTTPX transport docs](https://github.com/encode/httpx/blob/b5addb64f0161ff6bfe94c124ef76f6a1fba5254/docs/advanced/transports.md) | Connection-only built-in transport retries |
+| [HTTPcore cleanup](https://github.com/encode/httpcore/blob/10a658221deb38a4c5b16db55ab554b0bf731707/httpcore/_async/connection_pool.py#L248-L299) and [trace events](https://github.com/encode/httpcore/blob/10a658221deb38a4c5b16db55ab554b0bf731707/httpcore/_trace.py#L95-L107) | Cause suppression and safe capture timing |
+
+Disabled TLS verification, unlimited retries, static-IP changes, and global pool resets are not general remedies.
+Do not infer endpoint-wide failure from one request or network health from one successful small request.
+
+## Tests and activation
 
 ```powershell
 python -m unittest discover -s tests -v
-```
-
-Run transport fault tests only:
-
-```powershell
 python -m unittest discover -s tests -p test_transport_reliability.py -v
 ```
 
-These tests use mocked transports and temporary loopback servers. They do not send model requests or require upstream credentials.
-Fault cases include cause suppression, truncated bodies, stalled header waits, cancellation races, downstream transmission failures, and concurrent streams.
-Existing recovery tests cover retry limits, permanent errors, and the no-replay rule after partial output or tool activity.
-Recovery tests also simulate a 142.4-second initial failure, fixed transport-window expiry, and mixed HTTP and transport errors.
-Content tests cover preserved request IDs, HTTP and initial SSE rejections, unchanged input, and safe diagnostic counts.
+Tests use simulated upstreams and temporary loopback servers, not paid generation.
+Coverage includes slow first failures, fixed recovery deadlines, mixed failures, cause suppression, body truncation, and disconnect races.
+It also covers provider-key isolation, aliased SSE cleanup, and no replay after partial output.
 
-## Activation
-
-After an update, wait for active requests to finish before you stop and restart the proxy.
-The launcher does not replace an already healthy worker. Starting it again does not automatically load edited Python files.
-Keep TLS verification enabled. Do not include API keys or request bodies in diagnostic reports.
+After an update, wait for active work to finish and restart the proxy.
+A launcher health match can reuse an old worker; edited files alone do not activate new behavior.
+Keep TLS verification enabled and redact credentials, prompts, and account data from diagnostic reports.

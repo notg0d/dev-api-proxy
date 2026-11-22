@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import hashlib
+import io
 import json
 import logging
 import math
 import os
 import random
+import re
+import secrets
 import time
+import zlib
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
@@ -32,6 +38,256 @@ UPSTREAM = _upstream_base(os.environ.get("XINGCHI_UPSTREAM", "https://api.xingch
 logger = logging.getLogger("xingchi-proxy")
 MAX_429_RETRIES = 2
 MAX_429_RECOVERY_S = 8.0
+MAX_SERVER_ERROR_RETRIES = 2
+MAX_SERVER_ERROR_RECOVERY_S = 8.0
+RETRYABLE_SERVER_STATUSES = frozenset({500, 502, 503, 504})
+PERMANENT_PROVIDER_ERROR_CODES = frozenset({
+    "api_key_required", "invalid_api_key", "unauthenticated", "permission_denied",
+})
+_SESSION_FILTER_NAMES = frozenset({
+    "codex-session", "codex_session", "codexsession", "codex-session-id", "codex_session_id",
+    "codexsessionid", "session-id", "session_id", "sessionid", "thread-id", "thread_id",
+    "threadid", "x-client-request-id", "x-codex-window-id", "x-codex-turn-metadata",
+    "prompt_cache_key", "client_metadata", "conversation_id", "x-conversation-id", "x-session-id",
+    "x-session-affinity", "x-opencode-session", "x-thread-id", "x-codex-thread-id",
+    "installation_id", "turn_id", "parent_turn_id", "root_turn_id", "parent_thread_id",
+    "forked_from_thread_id", "window_id", "context_window_id", "x-codex-parent-thread-id",
+    "x-codex-installation-id", "x-codex-turn-state", "x-codex-routing-hint",
+})
+_SESSION_HEADER_NAMES = (
+    "x-session-id", "session-id", "session_id", "x-codex-session-id", "codex-session-id",
+)
+_PRESERVED_JSON_FIELDS = frozenset({"input", "messages", "tools", "functions", "text", "response_format"})
+_JSON_CONTENT_TYPE = re.compile(r"^application/(?:[\w.-]+\+)?json(?:\s*;|$)", re.IGNORECASE)
+_SESSION_FILTER_MODE_NAMES = {"0": 0, "1": 1, "2": 2}
+
+
+def _normalize_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+def _configured_session_filter_mode() -> int:
+    raw = os.environ.get("XINGCHI_SESSION_FILTER_MODE", "0").strip()
+    try:
+        return _SESSION_FILTER_MODE_NAMES[raw]
+    except KeyError as exc:
+        raise ValueError("XINGCHI_SESSION_FILTER_MODE must be 0, 1, or 2") from exc
+
+
+XINGCHI_SESSION_FILTER_MODE = _configured_session_filter_mode()
+XINGCHI_SESSION_FILTER_NAMES = tuple(
+    name.strip() for name in os.environ.get("XINGCHI_SESSION_FILTER_NAMES", "").split(",") if name.strip()
+)
+_CUSTOM_FILTER_NAMES = frozenset(_normalize_name(name) for name in XINGCHI_SESSION_FILTER_NAMES)
+_NORMALIZED_FILTER_NAMES = frozenset(
+    _normalize_name(name)
+    for name in (*_SESSION_FILTER_NAMES, *XINGCHI_SESSION_FILTER_NAMES)
+)
+_SESSION_REPLACEMENTS: dict[str, str] = {}
+_SESSION_COUNTS: dict[str, int] = {}
+SESSION_ROTATE_AFTER = 88
+
+
+def session_filter_status(mode: int | None = None) -> str:
+    """Return a concise status line for startup and diagnostics."""
+    mode = XINGCHI_SESSION_FILTER_MODE if mode is None else mode
+    if mode == 0:
+        return "disabled (mode 0)"
+    if mode == 1:
+        return "metadata filtering (mode 1)"
+    if mode == 2:
+        return f"metadata filtering; session rotation every {SESSION_ROTATE_AFTER} requests (mode 2)"
+    return f"unknown mode ({mode})"
+
+
+def is_filtered_name(name: str) -> bool:
+    normalized = _normalize_name(name)
+    return normalized in _NORMALIZED_FILTER_NAMES or (
+        "codex" in normalized and ("session" in normalized or "requestid" in normalized)
+    )
+
+
+def filter_headers(headers, *, mode: int | None = None) -> dict:
+    """Remove session-related headers; mode 2 retains the IDs it rotates."""
+    mode = XINGCHI_SESSION_FILTER_MODE if mode is None else mode
+    if mode == 0:
+        return dict(headers)
+    output = {}
+    for name, value in headers.items():
+        normalized = _normalize_name(name)
+        if (mode == 2 and name.lower() in _SESSION_HEADER_NAMES
+                and normalized not in _CUSTOM_FILTER_NAMES):
+            output[name] = value
+        elif not is_filtered_name(name):
+            output[name] = value
+    if mode == 2:
+        session_header = next((name for name in output if name.lower() in _SESSION_HEADER_NAMES and output.get(name)), None)
+        if session_header is not None:
+            replacement = _rotate_session_id(output[session_header])
+            for name in output:
+                if name.lower() in _SESSION_HEADER_NAMES:
+                    output[name] = replacement
+    return output
+
+
+def filter_query_params(params, *, mode: int | None = None) -> list[tuple[str, str]]:
+    """Filter query parameter names while preserving order and duplicate values."""
+    mode = XINGCHI_SESSION_FILTER_MODE if mode is None else mode
+    return list(params) if mode == 0 else [(name, value) for name, value in params if not is_filtered_name(name)]
+
+
+def filter_json_value(value):
+    """Filter session fields recursively without changing conversation or tool data."""
+    if isinstance(value, list):
+        return [filter_json_value(item) for item in value]
+    if isinstance(value, dict):
+        filtered = {}
+        for name, item in value.items():
+            if is_filtered_name(name):
+                continue
+            if name.lower() in _PRESERVED_JSON_FIELDS:
+                filtered[name] = item
+            else:
+                filtered[name] = filter_json_value(item)
+        return filtered
+    return value
+
+
+def _session_fingerprint(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+
+
+def _rotate_session_id(session_id: str) -> str:
+    """Return the active ID and rotate it when the request count reaches 88."""
+    original_key = _session_fingerprint(session_id)
+    current = session_id
+    visited = []
+    while True:
+        current_key = _session_fingerprint(current)
+        replacement = _SESSION_REPLACEMENTS.get(current_key)
+        if replacement is None:
+            break
+        visited.append(current_key)
+        current = replacement
+    for key in visited:
+        _SESSION_REPLACEMENTS[key] = current
+
+    current_key = _session_fingerprint(current)
+    count = _SESSION_COUNTS.get(current_key, 0) + 1
+    if count < SESSION_ROTATE_AFTER:
+        _SESSION_COUNTS[current_key] = count
+        return current
+
+    replacement = secrets.token_hex(16)
+    _SESSION_REPLACEMENTS[current_key] = replacement
+    _SESSION_REPLACEMENTS[original_key] = replacement
+    _SESSION_COUNTS.pop(current_key, None)
+    _SESSION_COUNTS[_session_fingerprint(replacement)] = 0
+    return replacement
+
+
+def reset_session_filter_state() -> None:
+    """Clear the in-memory rotation state (primarily for tests)."""
+    _SESSION_REPLACEMENTS.clear()
+    _SESSION_COUNTS.clear()
+
+
+def _zlib_decompress_limited(data: bytes, window_bits: int, limit: int) -> bytes:
+    decoder = zlib.decompressobj(window_bits)
+    output = bytearray()
+    for offset in range(0, len(data), 65536):
+        remaining = limit + 1 - len(output)
+        if remaining <= 0:
+            raise ValueError("decompressed JSON body exceeds the configured body limit")
+        output.extend(decoder.decompress(data[offset:offset + 65536], remaining))
+        if len(output) > limit or decoder.unconsumed_tail:
+            raise ValueError("decompressed JSON body exceeds the configured body limit")
+    remaining = limit + 1 - len(output)
+    output.extend(decoder.flush(max(1, remaining)))
+    if len(output) > limit:
+        raise ValueError("decompressed JSON body exceeds the configured body limit")
+    if not decoder.eof:
+        raise ValueError("compressed JSON request body is incomplete")
+    return bytes(output)
+
+
+def _decompress_body(data: bytes, encodings, limit: int) -> bytes:
+    for encoding in reversed(encodings):
+        if encoding in ("", "identity"):
+            continue
+        if encoding == "gzip":
+            with gzip.GzipFile(fileobj=io.BytesIO(data)) as stream:
+                data = stream.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("decompressed JSON body exceeds the configured body limit")
+        elif encoding == "deflate":
+            try:
+                data = _zlib_decompress_limited(data, zlib.MAX_WBITS, limit)
+            except zlib.error:
+                data = _zlib_decompress_limited(data, -zlib.MAX_WBITS, limit)
+        elif encoding == "br":
+            try:
+                import brotli
+            except ImportError:
+                try:
+                    import brotlicffi as brotli
+                except ImportError as exc:
+                    raise ValueError("Brotli JSON bodies require brotli or brotlicffi") from exc
+            data = brotli.decompress(data)
+            if len(data) > limit:
+                raise ValueError("decompressed JSON body exceeds the configured body limit")
+        elif encoding == "zstd":
+            try:
+                import zstandard
+            except ImportError as exc:
+                raise ValueError("Zstandard JSON bodies require the zstandard package") from exc
+            data = zstandard.ZstdDecompressor().decompress(data, max_output_size=limit + 1)
+            if len(data) > limit:
+                raise ValueError("decompressed JSON body exceeds the configured body limit")
+        else:
+            raise ValueError(f"unsupported content-encoding: {encoding}")
+    return data
+
+
+def filter_json_body(body: bytes, original_headers, output_headers, *, max_body_bytes: int):
+    """Filter an encoded JSON body and return its new bytes and headers."""
+    content_type = next((value for name, value in original_headers.items() if name.lower() == "content-type"), "")
+    if not body or not _JSON_CONTENT_TYPE.match(content_type):
+        return body, output_headers, None
+    content_encoding = next((value for name, value in original_headers.items() if name.lower() == "content-encoding"), "identity")
+    encodings = [item.strip().lower() for item in content_encoding.split(",") if item.strip()]
+    try:
+        decoded = _decompress_body(body, encodings, max_body_bytes)
+        value = json.loads(decoded)
+        cleaned = json.dumps(filter_json_value(value), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except Exception as exc:
+        error = JSONResponse(status_code=400, content={"error": {
+            "type": "invalid_request_error", "code": "invalid_request_body",
+            "message": f"Cannot filter JSON request body: {exc}",
+        }})
+        return body, output_headers, error
+    if len(cleaned) > max_body_bytes:
+        error = JSONResponse(status_code=413, content={"error": {
+            "type": "invalid_request_error", "code": "payload_too_large",
+            "message": "Filtered JSON body exceeds PROXY_MAX_BODY_BYTES",
+        }})
+        return body, output_headers, error
+    cleaned_headers = {name: value for name, value in output_headers.items()
+                       if name.lower() not in ("content-encoding", "content-length")}
+    return cleaned, cleaned_headers, None
+
+
+def prepare_session_filtered_request(headers, body: bytes, params, *, backend, mode: int | None = None):
+    """Prepare a Xingchi request after filtering headers, query, and JSON fields."""
+    mode = XINGCHI_SESSION_FILTER_MODE if mode is None else mode
+    if mode == 0:
+        return dict(headers), body, list(params), None
+    filtered_headers = filter_headers(headers, mode=mode)
+    filtered_params = filter_query_params(params, mode=mode)
+    filtered_body, filtered_headers, error = filter_json_body(
+        body, headers, filtered_headers, max_body_bytes=backend.MAX_BODY_BYTES,
+    )
+    return filtered_headers, filtered_body, filtered_params, error
 
 
 def _retry_delay(headers, retry: int) -> float:
@@ -132,7 +388,7 @@ class _ProviderLogger(logging.LoggerAdapter):
 
 
 def register_chat_conversion(
-    app: FastAPI, backend, *, prefix: str, upstream: str, provider: str,
+    app: FastAPI, backend, *, prefix: str, upstream, provider: str,
     endpoint_path: str = "/v1/responses",
 ) -> None:
     """Translate Chat Completions to the provider's Responses endpoint."""
@@ -156,11 +412,20 @@ def register_chat_conversion(
         )
         headers["content-type"] = "application/json"
         body = json.dumps(chat_proxy.build_responses_payload(payload), ensure_ascii=False).encode("utf-8")
+        params = request.query_params.multi_items()
+        if provider == "xingchi":
+            # The translated JSON body is newly built and is not content-encoded.
+            headers.pop("content-encoding", None)
+            headers, body, params, filter_error = prepare_session_filtered_request(
+                headers, body, params, backend=backend,
+            )
+            if filter_error is not None:
+                return filter_error
         response = None
         try:
             response = await backend._send_with_transport_retry(
-                backend.get_shared_client(), method="POST", url=upstream + endpoint_path,
-                headers=headers, content=body, params=request.query_params.multi_items(),
+                backend.get_shared_client(), method="POST", url=(upstream() if callable(upstream) else upstream) + endpoint_path,
+                headers=headers, content=body, params=params,
                 stream=bool(payload.get("stream")), max_retries=2, request=request,
             )
             response_headers = backend._clean_response_headers(response.headers)
@@ -202,7 +467,7 @@ def register_chat_conversion(
 def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstream=None,
                     prefix: str = XINGCHI_PREFIX, path_mapper=xingchi_upstream_path) -> None:
     """Install the same native relay on both proxy applications."""
-    label = "FreeGG" if provider == "freegg" else "Xingchi"
+    label = {"freegg": "FreeGG", "omniai": "OmniAi"}.get(provider, "Xingchi")
     logger = _ProviderLogger(logging.getLogger("xingchi-proxy"), {"label": label})
     if provider == "xingchi":
         register_chat_conversion(app, backend, prefix=prefix, upstream=upstream or UPSTREAM, provider=provider)
@@ -217,6 +482,13 @@ def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstrea
             dict(request.headers), fallback_keys=(provider.upper() + "_API_KEY",), agentrouter_compat=False,
         )
         body = await request.body()
+        params = request.query_params.multi_items()
+        if provider == "xingchi":
+            headers, body, params, filter_error = prepare_session_filtered_request(
+                headers, body, params, backend=backend,
+            )
+            if filter_error is not None:
+                return filter_error
         response = None
         retries = 0
         recovery_deadline = None
@@ -228,7 +500,7 @@ def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstrea
                 try:
                     response = await backend._send_with_transport_retry(
                         backend.get_shared_client(), method=request.method, url=(upstream() if upstream else UPSTREAM) + upstream_path,
-                        headers=headers, content=body, params=request.query_params.multi_items(),
+                        headers=headers, content=body, params=params,
                         stream=True, max_retries=1, request=request,
                     )
                 except backend.RETRYABLE_TRANSPORT_ERRORS as exc:
@@ -249,32 +521,45 @@ def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstrea
                         logger.warning("[Xingchi Retry Exhausted] Transport failure; reason=time budget: %s", diagnostic)
                         raise
                     continue
-                if response.status_code != 429:
+                is_rate_limit = response.status_code == 429
+                is_server_error = response.status_code in RETRYABLE_SERVER_STATUSES
+                if not is_rate_limit and not is_server_error:
                     break
                 if recovery_deadline is None:
-                    recovery_deadline = time.monotonic() + MAX_429_RECOVERY_S
+                    recovery_budget = MAX_429_RECOVERY_S if is_rate_limit else MAX_SERVER_ERROR_RECOVERY_S
+                    recovery_deadline = time.monotonic() + recovery_budget
                 content = await backend._read_and_close_response(response, request)
                 try:
                     payload = json.loads(content)
                 except (ValueError, UnicodeDecodeError):
                     payload = None
                 code, message, _ = backend._extract_error_fields(payload if isinstance(payload, dict) else None, "")
-                # Quota, authentication, and policy rejections can also use 429.
-                permanent = (
-                    backend.classify_upstream_error(429, code, message) == "permanent"
-                    or code.lower() in {"api_key_required", "invalid_api_key", "unauthenticated", "permission_denied"}
-                )
+                if is_rate_limit:
+                    # Quota, authentication, and policy rejections can also use 429.
+                    permanent = (
+                        backend.classify_upstream_error(429, code, message) == "permanent"
+                        or code.lower() in PERMANENT_PROVIDER_ERROR_CODES
+                    )
+                    retry_limit = MAX_429_RETRIES
+                    retry_label = "HTTP 429"
+                else:
+                    permanent = (
+                        backend.classify_upstream_error(response.status_code, code, message) != "transient"
+                        or code.lower() in PERMANENT_PROVIDER_ERROR_CODES
+                    )
+                    retry_limit = MAX_SERVER_ERROR_RETRIES
+                    retry_label = f"HTTP {response.status_code}"
                 delay = _retry_delay(response.headers, retries)
                 remaining = recovery_deadline - time.monotonic()
-                if permanent or retries >= MAX_429_RETRIES or delay >= remaining:
-                    reason = "permanent rejection" if permanent else "retry limit" if retries >= MAX_429_RETRIES else "time budget"
-                    logger.warning("[Xingchi Retry Exhausted] HTTP 429; retries=%d; reason=%s", retries, reason)
+                if permanent or retries >= retry_limit or delay >= remaining:
+                    reason = "permanent rejection" if permanent else "retry limit" if retries >= retry_limit else "time budget"
+                    logger.warning("[Xingchi Retry Exhausted] %s; retries=%d; reason=%s", retry_label, retries, reason)
                     break
                 retries += 1
-                logger.warning("[Xingchi Retry %d/%d] HTTP 429; waiting %.2fs", retries, MAX_429_RETRIES, delay)
+                logger.warning("[Xingchi Retry %d/%d] %s; waiting %.2fs", retries, retry_limit, retry_label, delay)
                 await _wait_retry(backend, request, delay)
                 if time.monotonic() >= recovery_deadline:
-                    logger.warning("[Xingchi Retry Exhausted] HTTP 429; retries=%d; reason=time budget", retries - 1)
+                    logger.warning("[Xingchi Retry Exhausted] %s; retries=%d; reason=time budget", retry_label, retries - 1)
                     break
 
             if retries and response.status_code != 429:

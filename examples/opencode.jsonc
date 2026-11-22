@@ -1,0 +1,73 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Merge these providers into your global config. Select models your keys can access.
+  // Saved provider connections or server environment variables supply the API keys.
+  "providers": {
+    "Primary": {
+      "name": "Primary upstream (local proxy)",
+      "package": "@opencode/ai/providers/openai-compatible/responses",
+      "env": ["CODEX_GATEWAY_API_KEY", "AGENTROUTER_API_KEY"],
+      "settings": {
+        "baseURL": "http://127.0.0.1:8789/v1",
+        "transport": "http",
+        "encoding": "none"
+      },
+      "headers": { "X-Proxy-Token": "{env:PROXY_AUTH_TOKEN}" },
+      "models": {
+        "gpt-6.1-sol": { "name": "Primary · GPT-6.1 Sol" }
+      }
+    },
+    "Xingchi": {
+      "name": "Xingchi (local proxy)",
+      "package": "@opencode/ai/providers/openai-compatible/responses",
+      "env": ["XINGCHI_API_KEY"],
+      "settings": {
+        "baseURL": "http://127.0.0.1:8789/xingchi/v1",
+        "transport": "http",
+        "encoding": "none"
+      },
+      "headers": { "X-Proxy-Token": "{env:PROXY_AUTH_TOKEN}" },
+      "models": {
+        "gpt-6.1-sol": { "name": "Xingchi · GPT-6.1 Sol" }
+      }
+    },
+    "OmniAi": {
+      "name": "OmniAi (local proxy)",
+      "package": "@opencode/ai/providers/openai-compatible/responses",
+      "env": ["OMNIAI_API_KEY"],
+      "settings": {
+        "baseURL": "http://127.0.0.1:8789/omniai/v1",
+        "transport": "http",
+        "encoding": "none"
+      },
+      "headers": { "X-Proxy-Token": "{env:PROXY_AUTH_TOKEN}" },
+      "models": {
+        "gpt-6.1-sol": { "name": "OmniAi · GPT-6.1 Sol" }
+      }
+    },
+    "FreeGG": {
+      "name": "FreeGG (local proxy)",
+      "package": "@opencode/ai/providers/openai-compatible/responses",
+      "env": ["FREEGG_API_KEY"],
+      "settings": {
+        "baseURL": "http://127.0.0.1:8789/freegg/v1",
+        "transport": "http",
+        "encoding": "none"
+      },
+      "headers": { "X-Proxy-Token": "{env:PROXY_AUTH_TOKEN}" },
+      "models": {
+        "gpt-6.1-sol": { "name": "FreeGG · GPT-6.1 Sol" }
+      }
+    },
+    "FreeGG-Anthropic": {
+      "name": "FreeGG Anthropic (local proxy)",
+      "package": "@opencode/ai/providers/anthropic-compatible",
+      "env": ["FREEGG_API_KEY"],
+      "settings": { "baseURL": "http://127.0.0.1:8789/freegg/v1" },
+      "headers": { "X-Proxy-Token": "{env:PROXY_AUTH_TOKEN}" },
+      "models": {
+        "claude-opus-5": { "name": "FreeGG · Claude Opus 5" }
+      }
+    }
+  }
+}
