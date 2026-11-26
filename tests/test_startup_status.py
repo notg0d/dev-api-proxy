@@ -43,7 +43,8 @@ class StartupStatusTests(unittest.TestCase):
 
     def test_summary_does_not_disclose_provider_keys(self):
         output = io.StringIO()
-        with patch.dict(os.environ, {"OMNIAI_API_KEY": "private-omniai-key", "FREEGG_API_KEY": "private-freegg-key"}, clear=True), \
+        with patch.dict(os.environ, {"OMNIAI_API_KEY": "private-omniai-key", "FREEGG_API_KEY": "private-freegg-key",
+                                     "MOYUU_API_KEY": "private-moyuu-key"}, clear=True), \
                 patch.object(proxy, "PROXY_AUTH_TOKEN", "private-local-token"), contextlib.redirect_stdout(output):
             proxy.print_startup_summary(mode="combined", host="127.0.0.1", port=8789)
         text = output.getvalue()
@@ -51,6 +52,7 @@ class StartupStatusTests(unittest.TestCase):
         self.assertIn("Version      " + proxy.VERSION, text)
         self.assertIn("/omniai/v1 | client key or configured fallback", text)
         self.assertIn("/freegg/v1 | client key or configured fallback", text)
+        self.assertIn("/moyuu/v1 | client key or configured fallback", text)
         self.assertNotIn("private-", text)
         self.assertNotIn("No fallback AgentRouter", text)
 

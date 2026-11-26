@@ -550,8 +550,8 @@ class ConfigurationAndServiceTests(unittest.TestCase):
 
     def test_updater_compiles_all_runtime_modules(self):
         self.assertTrue({
-            "version.py", "proxy.py", "chat_proxy.py", "xingchi_proxy.py", "freegg_proxy.py",
-            "omniai_proxy.py", "provider_routing.py", "startup_status.py", "model_catalog.py",
+            "version.py", "proxy.py", "chat_proxy.py", "xingchi_proxy.py", "xingchi_context.py", "freegg_proxy.py",
+            "omniai_proxy.py", "moyuu_proxy.py", "provider_routing.py", "startup_status.py", "model_catalog.py",
             "request_guard.py", "service.py", "updater.py",
         }.issubset(updater._CORE_PYTHON_FILES))
 

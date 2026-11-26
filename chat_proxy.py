@@ -28,6 +28,7 @@ import proxy
 import xingchi_proxy
 import freegg_proxy
 import omniai_proxy
+import moyuu_proxy
 
 logger = logging.getLogger("dev-api-proxy.combined")
 
@@ -707,7 +708,7 @@ async def _app_lifespan(_: FastAPI):
 
 app = FastAPI(
     title="dev-api-proxy",
-    description="Local Chat Completions and Responses proxy for OpenCode with primary, Xingchi, FreeGG, and OmniAi routes",
+    description="Local Chat Completions and Responses proxy for OpenCode with primary, Xingchi, FreeGG, OmniAi, and Moyuu routes",
     version=VERSION,
     lifespan=_app_lifespan,
 )
@@ -731,13 +732,14 @@ async def health():
         "max_body_bytes": proxy.MAX_BODY_BYTES,
         "transport_recovery_wait_seconds": proxy.MAX_TRANSPORT_RECOVERY_WAIT_S,
         "xingchi_session_filter_mode": xingchi_proxy.XINGCHI_SESSION_FILTER_MODE,
+        "xingchi_context_compaction": xingchi_proxy.XINGCHI_SESSION_FILTER_MODE == 2,
         "provider_model_prefixes": list(proxy.PROVIDER_LABELS),
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": round(time.time() - STATS["start_time"], 1),
         "upstream": UPSTREAM,
         "additional_upstreams": {
             "xingchi": xingchi_proxy.UPSTREAM, "freegg": freegg_proxy.UPSTREAM,
-            "omniai": omniai_proxy.UPSTREAM,
+            "omniai": omniai_proxy.UPSTREAM, "moyuu": moyuu_proxy.UPSTREAM,
         },
         "stats": STATS,
         "responses_stats": proxy.STATS,
@@ -811,6 +813,7 @@ async def handle_chat_completions(request: Request):
 xingchi_proxy.register_routes(app, proxy)
 freegg_proxy.register_routes(app, proxy)
 omniai_proxy.register_routes(app, proxy)
+moyuu_proxy.register_routes(app, proxy)
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])

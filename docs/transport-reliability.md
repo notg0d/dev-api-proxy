@@ -8,8 +8,8 @@ A retry after accepted work can cause duplicate execution or additional charges.
 | Path | Retry owner | Default limit | Initial SSE inspection |
 | --- | --- | --- | --- |
 | Primary Responses and primary Chat in combined mode | Shared primary recovery loop | Six transient retries; separate bounded resource-mismatch fallback | Yes |
-| Native Xingchi, OmniAi, and FreeGG relays | Native relay loop | Two retries within eight seconds from first eligible failure | No |
-| Converted Xingchi/FreeGG Chat and Codex-facade Chat | Transport helper | Two transport attempts total | No |
+| Native Xingchi, OmniAi, FreeGG, and Moyuu relays | Native relay loop | Two retries within eight seconds from first eligible failure | No |
+| Converted Xingchi/FreeGG/Moyuu Chat and Codex-facade Chat | Transport helper | Two transport attempts total | No |
 | Generic primary forwarding | Transport helper | Two transport attempts total | No; response is buffered |
 
 Provider-qualified models use the selected relay's policy after dispatch.
@@ -67,7 +67,7 @@ Native retries do not start the primary shared cooldown.
 
 ## Provider Chat conversion
 
-Xingchi and FreeGG Chat requests are converted to Responses for compatibility.
+Xingchi, FreeGG, and Moyuu Chat requests are converted to Responses for compatibility.
 The Codex facades also use direct conversion.
 They can use one transport retry, not the native relay's HTTP retry window.
 

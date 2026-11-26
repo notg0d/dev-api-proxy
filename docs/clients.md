@@ -43,11 +43,11 @@ Keep separate provider definitions for separate native URLs and credentials.
 
 For Responses, use `@opencode/ai/providers/openai-compatible/responses`.
 For Chat Completions, use `@opencode/ai/providers/openai-compatible`.
-The proxy converts primary, Xingchi, and FreeGG Chat; OmniAi Chat is native.
+The proxy converts primary, Xingchi, FreeGG, and Moyuu Chat; OmniAi Chat is native.
 
-For FreeGG Anthropic, use `@opencode/ai/providers/anthropic-compatible` and `/freegg/v1` as the package base.
+For FreeGG or Moyuu Anthropic, use `@opencode/ai/providers/anthropic-compatible` and `/freegg/v1` or `/moyuu/v1` as the package base.
 It sends `/messages` relative to that base.
-The proxy also accepts the unversioned `/freegg/messages` alias.
+The proxy also accepts the unversioned `/freegg/messages` and `/moyuu/messages` aliases.
 Use the API path convention required by your client package.
 
 ### Key sources
@@ -128,6 +128,15 @@ env_key = "FREEGG_API_KEY"
 requires_openai_auth = false
 supports_websockets = false
 env_http_headers = { "X-Proxy-Token" = "PROXY_AUTH_TOKEN" }
+
+[model_providers.moyuu]
+name = "Moyuu (local proxy)"
+base_url = "http://127.0.0.1:8789/moyuu/v1"
+wire_api = "responses"
+env_key = "MOYUU_API_KEY"
+requires_openai_auth = false
+supports_websockets = false
+env_http_headers = { "X-Proxy-Token" = "PROXY_AUTH_TOKEN" }
 ```
 
 Restart ChatGPT desktop after editing its provider configuration.
@@ -171,13 +180,13 @@ python model_catalog.py --source source-models.json --output provider-picker-mod
 
 The generator:
 
-- Creates Xingchi, OmniAi, and FreeGG labels and matching `provider/model` IDs.
+- Creates Xingchi, OmniAi, FreeGG, and Moyuu labels and matching `provider/model` IDs.
 - Copies source model instructions, capabilities, and reasoning options.
 - Gives each provider its own compaction fingerprint prefix.
 - Retains unqualified IDs as hidden compatibility entries for older chats.
 - Writes output atomically and does not overwrite the source.
 
-Four source models produce 12 labelled picker choices and four hidden compatibility entries.
+Four source models produce 16 labelled picker choices and four hidden compatibility entries.
 Use `--overwrite` only to replace a previously generated output.
 Do not publish source or generated catalogs containing private instructions.
 
@@ -204,7 +213,8 @@ env_http_headers = { "X-Proxy-Token" = "PROXY_AUTH_TOKEN" }
 enable_request_compression = false
 ```
 
-Configure `XINGCHI_API_KEY`, `OMNIAI_API_KEY`, and `FREEGG_API_KEY` on the proxy for this canonical base.
+For this canonical base, configure a proxy-side key for each provider you want to select.
+Use `XINGCHI_API_KEY`, `OMNIAI_API_KEY`, `FREEGG_API_KEY`, or `MOYUU_API_KEY` for the matching provider.
 The client gateway does not need an unrelated upstream key.
 
 For an existing Xingchi connection, you can keep its provider ID, native base URL, and existing client key.
@@ -221,11 +231,12 @@ This avoids changing saved chats to another gateway provider ID.
 | `/xingchi/v1` | `xingchi/<model>` | Matching client key, or Xingchi fallback |
 | `/xingchi/v1` | `omniai/<model>` | Proxy-side OmniAi key; the client Xingchi key is removed |
 | `/xingchi/v1` | `freegg/<model>` | Proxy-side FreeGG key; the client Xingchi key is removed |
+| `/xingchi/v1` | `moyuu/<model>` | Proxy-side Moyuu key; the client Xingchi key is removed |
 
 Cookie and unrelated account-routing credentials are removed from aliased requests.
 Missing fallback keys return `400` with `provider_api_key_missing`, without an upstream request.
 Unsupported provider routes return `unsupported_provider_route`; they do not fall back to the anchor provider.
-FreeGG input-token counts are unsupported by the current allowlist.
+FreeGG and Moyuu input-token counts are unsupported by the current allowlist.
 
 `X-Proxy-Model-Routing: 1` makes undecodable picker requests fail locally instead of silently using the original native path.
 The header is removed before upstream transmission.

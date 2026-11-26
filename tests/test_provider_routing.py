@@ -37,7 +37,8 @@ class ProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
             patch.object(proxy, "MAX_BODY_BYTES", 20971520),
             patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 0),
             patch.dict(os.environ, {"XINGCHI_API_KEY": "xingchi-key-fixture", "OMNIAI_API_KEY": "omniai-key-fixture",
-                                    "FREEGG_API_KEY": "freegg-key-fixture", "CODEX_GATEWAY_API_KEY": "primary-key-fixture"}, clear=True),
+                                    "FREEGG_API_KEY": "freegg-key-fixture", "MOYUU_API_KEY": "moyuu-key-fixture",
+                                    "CODEX_GATEWAY_API_KEY": "primary-key-fixture"}, clear=True),
         ):
             setting.start()
             self.addCleanup(setting.stop)
@@ -51,7 +52,8 @@ class ProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_picker_aliases_use_only_the_selected_provider_key(self):
         for app in (proxy.app, chat_proxy.app):
             async with self.client(app) as client:
-                for provider, host in (("xingchi", "api.xingchiapi.com"), ("omniai", "sub.omniai.cc"), ("freegg", "freegg.app")):
+                for provider, host in (("xingchi", "api.xingchiapi.com"), ("omniai", "sub.omniai.cc"),
+                                       ("freegg", "freegg.app"), ("moyuu", "moyuu.cc")):
                     for path in ("/v1/responses", "/responses", "/v1/responses/compact"):
                         payload = {"model": provider + "/gpt-test", "input": "hi", "previous_response_id": "keep"}
                         result = await client.post(path + "?tag=a&tag=b", json=payload, headers={
@@ -71,13 +73,56 @@ class ProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_chat_aliases_use_the_native_or_converted_provider_route(self):
         async with self.client(chat_proxy.app) as client:
-            for provider, target in (("xingchi", "/v1/responses"), ("omniai", "/v1/chat/completions"), ("freegg", "/v1/responses")):
+            for provider, target in (("xingchi", "/v1/responses"), ("omniai", "/v1/chat/completions"),
+                                     ("freegg", "/v1/responses"), ("moyuu", "/v1/responses")):
                 result = await client.post("/v1/chat/completions", json={
                     "model": provider + "/gpt-test", "messages": [{"role": "user", "content": "hi"}],
                 })
                 self.assertEqual(result.status_code, 200)
                 self.assertEqual(self.calls[-1].url.path, target)
                 self.assertEqual(json.loads(self.calls[-1].content)["model"], "gpt-test")
+
+    async def test_desktop_and_codex_routes_rotate_sessions_and_preserve_streams(self):
+        routes = (
+            ("/v1/responses", "xingchi/gpt-test", "/v1/responses"),
+            ("/xingchi/v1/responses", "xingchi/gpt-test", "/v1/responses"),
+            ("/xingchi/codex/v1/responses", "gpt-test", "/backend-api/codex/responses"),
+            ("/xingchi/backend-api/codex/responses", "gpt-test", "/backend-api/codex/responses"),
+        )
+        frames = (b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+                  b'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp-1","status":"completed"}}\n\n')
+        history = [{"type": "function_call", "call_id": "call-1", "name": "read_file", "arguments": "{}"},
+                   {"type": "function_call_output", "call_id": "call-1", "output": "file contents"}]
+        self.addCleanup(xingchi_proxy.reset_session_filter_state)
+        for app in (proxy.app, chat_proxy.app):
+            for path, model, target in routes:
+                with self.subTest(app=app.title, path=path):
+                    xingchi_proxy.reset_session_filter_state()
+                    start = len(self.calls)
+                    self.results.extend(httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                                       stream=ByteStream([frames])) for _ in range(3))
+                    with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 2), \
+                            patch.object(xingchi_proxy, "SESSION_ROTATE_AFTER", 3), \
+                            patch.object(xingchi_proxy.secrets, "token_hex", side_effect=["first", "rotated"]):
+                        async with self.client(app) as client:
+                            for _ in range(3):
+                                result = await client.post(path, json={
+                                    "model": model, "input": history, "stream": True, "store": False,
+                                    "prompt_cache_key": "desktop-session", "previous_response_id": "resp-previous",
+                                }, headers={"session_id": "desktop-session", "x-codex-turn-state": "private",
+                                            "x-codex-turn-metadata": "private", "x-proxy-model-routing": "1"})
+                                self.assertEqual(result.status_code, 200)
+                                self.assertEqual(result.content, frames)
+                    calls = self.calls[start:]
+                    self.assertEqual([sent.headers["session_id"] for sent in calls], ["first", "first", "rotated"])
+                    for sent in calls:
+                        self.assertEqual(sent.url.path, target)
+                        self.assertNotIn("x-codex-turn-state", sent.headers)
+                        self.assertNotIn("x-codex-turn-metadata", sent.headers)
+                        self.assertEqual(json.loads(sent.content), {
+                            "model": "gpt-test", "input": history, "stream": True, "store": False,
+                            "previous_response_id": "resp-previous",
+                        })
 
     async def test_token_count_aliases_do_not_fall_back_to_the_anchor_provider(self):
         async with self.client(proxy.app) as client:
@@ -118,7 +163,7 @@ class ProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cross_provider_picker_switch_does_not_forward_the_anchor_key(self):
         async with self.client(chat_proxy.app) as client:
-            for provider, host in (("omniai", "sub.omniai.cc"), ("freegg", "freegg.app")):
+            for provider, host in (("omniai", "sub.omniai.cc"), ("freegg", "freegg.app"), ("moyuu", "moyuu.cc")):
                 result = await client.post("/xingchi/v1/responses", json={"model": provider + "/gpt-test", "input": "hi"},
                                            headers={"authorization": "Bearer existing-xingchi-key"})
                 self.assertEqual(result.status_code, 200)
@@ -253,7 +298,7 @@ class ModelAliasTests(unittest.TestCase):
         self.assertEqual(split_model_alias("OmniAi/vendor/gpt-test"), ("omniai", "vendor/gpt-test"))
         self.assertIsNone(split_model_alias("gpt-test"))
         self.assertIsNone(split_model_alias("unrelated/gpt-test"))
-        for model in ("omniai/", "xingchi/ ", "freegg/gpt\n"):
+        for model in ("omniai/", "xingchi/ ", "freegg/gpt\n", "moyuu/"):
             with self.assertRaises(ValueError):
                 split_model_alias(model)
 

@@ -23,7 +23,9 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from provider_routing import PROVIDER_LABELS
 from request_guard import XINGCHI_PREFIX, xingchi_upstream_path
+import xingchi_context
 
 
 def _upstream_base(raw: str) -> str:
@@ -35,6 +37,7 @@ def _upstream_base(raw: str) -> str:
 
 
 UPSTREAM = _upstream_base(os.environ.get("XINGCHI_UPSTREAM", "https://api.xingchiapi.com"))
+USER_AGENT = os.environ.get("XINGCHI_USER_AGENT", "").strip()
 logger = logging.getLogger("xingchi-proxy")
 MAX_429_RETRIES = 2
 MAX_429_RECOVERY_S = 8.0
@@ -56,6 +59,7 @@ _SESSION_FILTER_NAMES = frozenset({
 })
 _SESSION_HEADER_NAMES = (
     "x-session-id", "session-id", "session_id", "x-codex-session-id", "codex-session-id",
+    "codex-session", "thread-id", "x-thread-id", "x-codex-thread-id", "x-opencode-session",
 )
 _PRESERVED_JSON_FIELDS = frozenset({"input", "messages", "tools", "functions", "text", "response_format"})
 _JSON_CONTENT_TYPE = re.compile(r"^application/(?:[\w.-]+\+)?json(?:\s*;|$)", re.IGNORECASE)
@@ -64,6 +68,9 @@ _SESSION_FILTER_MODE_NAMES = {"0": 0, "1": 1, "2": 2}
 
 def _normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(name).lower())
+
+
+_NORMALIZED_SESSION_HEADER_NAMES = frozenset(_normalize_name(name) for name in _SESSION_HEADER_NAMES)
 
 
 def _configured_session_filter_mode() -> int:
@@ -88,6 +95,15 @@ _SESSION_COUNTS: dict[str, int] = {}
 SESSION_ROTATE_AFTER = 88
 
 
+def prepare_client_headers(headers) -> dict:
+    """Apply an optional Xingchi client identifier without changing credentials."""
+    if not USER_AGENT:
+        return dict(headers)
+    output = {name: value for name, value in headers.items() if name.lower() != "user-agent"}
+    output["user-agent"] = USER_AGENT
+    return output
+
+
 def session_filter_status(mode: int | None = None) -> str:
     """Return a concise status line for startup and diagnostics."""
     mode = XINGCHI_SESSION_FILTER_MODE if mode is None else mode
@@ -96,7 +112,8 @@ def session_filter_status(mode: int | None = None) -> str:
     if mode == 1:
         return "metadata filtering (mode 1)"
     if mode == 2:
-        return f"metadata filtering; session rotation every {SESSION_ROTATE_AFTER} requests (mode 2)"
+        return (f"metadata filtering; session rotation every {SESSION_ROTATE_AFTER} requests (mode 2); "
+                f"history summaries at {xingchi_context.COMPACT_AT_TURNS} model turns")
     return f"unknown mode ({mode})"
 
 
@@ -107,7 +124,7 @@ def is_filtered_name(name: str) -> bool:
     )
 
 
-def filter_headers(headers, *, mode: int | None = None) -> dict:
+def filter_headers(headers, *, mode: int | None = None, rotate_session: bool = True) -> dict:
     """Remove session-related headers; mode 2 retains the IDs it rotates."""
     mode = XINGCHI_SESSION_FILTER_MODE if mode is None else mode
     if mode == 0:
@@ -115,18 +132,26 @@ def filter_headers(headers, *, mode: int | None = None) -> dict:
     output = {}
     for name, value in headers.items():
         normalized = _normalize_name(name)
-        if (mode == 2 and name.lower() in _SESSION_HEADER_NAMES
+        if (mode == 2 and normalized in _NORMALIZED_SESSION_HEADER_NAMES
                 and normalized not in _CUSTOM_FILTER_NAMES):
             output[name] = value
         elif not is_filtered_name(name):
             output[name] = value
-    if mode == 2:
-        session_header = next((name for name in output if name.lower() in _SESSION_HEADER_NAMES and output.get(name)), None)
-        if session_header is not None:
-            replacement = _rotate_session_id(output[session_header])
+    if mode == 2 and rotate_session:
+        session_header = next((name for name in output
+                               if _normalize_name(name) in _NORMALIZED_SESSION_HEADER_NAMES and output.get(name)), None)
+        # Scope anonymous clients and reused client IDs to their upstream credentials.
+        # Always send an explicit ID so Sub2API does not derive one from the input.
+        if session_header is not None or "sessionid" not in _CUSTOM_FILTER_NAMES:
+            credentials = sorted((name.lower(), value) for name, value in headers.items()
+                                 if name.lower() in ("authorization", "x-api-key", "x-goog-api-key"))
+            session_key = json.dumps([credentials, output.get(session_header)], separators=(",", ":"))
+            replacement = _rotate_session_id(session_key)
             for name in output:
-                if name.lower() in _SESSION_HEADER_NAMES:
+                if _normalize_name(name) in _NORMALIZED_SESSION_HEADER_NAMES:
                     output[name] = replacement
+            if "sessionid" not in _CUSTOM_FILTER_NAMES:
+                output["session_id"] = replacement
     return output
 
 
@@ -158,32 +183,14 @@ def _session_fingerprint(session_id: str) -> str:
 
 
 def _rotate_session_id(session_id: str) -> str:
-    """Return the active ID and rotate it when the request count reaches 88."""
-    original_key = _session_fingerprint(session_id)
-    current = session_id
-    visited = []
-    while True:
-        current_key = _session_fingerprint(current)
-        replacement = _SESSION_REPLACEMENTS.get(current_key)
-        if replacement is None:
-            break
-        visited.append(current_key)
-        current = replacement
-    for key in visited:
-        _SESSION_REPLACEMENTS[key] = current
-
-    current_key = _session_fingerprint(current)
-    count = _SESSION_COUNTS.get(current_key, 0) + 1
-    if count < SESSION_ROTATE_AFTER:
-        _SESSION_COUNTS[current_key] = count
-        return current
-
-    replacement = secrets.token_hex(16)
-    _SESSION_REPLACEMENTS[current_key] = replacement
-    _SESSION_REPLACEMENTS[original_key] = replacement
-    _SESSION_COUNTS.pop(current_key, None)
-    _SESSION_COUNTS[_session_fingerprint(replacement)] = 0
-    return replacement
+    """Assign a fresh upstream ID, counting every send toward its rotation."""
+    key = _session_fingerprint(session_id)
+    count = _SESSION_COUNTS.get(key, 0) + 1
+    if key not in _SESSION_REPLACEMENTS or count >= SESSION_ROTATE_AFTER:
+        _SESSION_REPLACEMENTS[key] = secrets.token_hex(16)
+        count = 1
+    _SESSION_COUNTS[key] = count
+    return _SESSION_REPLACEMENTS[key]
 
 
 def reset_session_filter_state() -> None:
@@ -277,12 +284,13 @@ def filter_json_body(body: bytes, original_headers, output_headers, *, max_body_
     return cleaned, cleaned_headers, None
 
 
-def prepare_session_filtered_request(headers, body: bytes, params, *, backend, mode: int | None = None):
+def prepare_session_filtered_request(headers, body: bytes, params, *, backend, mode: int | None = None,
+                                     rotate_session: bool = True):
     """Prepare a Xingchi request after filtering headers, query, and JSON fields."""
     mode = XINGCHI_SESSION_FILTER_MODE if mode is None else mode
     if mode == 0:
         return dict(headers), body, list(params), None
-    filtered_headers = filter_headers(headers, mode=mode)
+    filtered_headers = filter_headers(headers, mode=mode, rotate_session=rotate_session)
     filtered_params = filter_query_params(params, mode=mode)
     filtered_body, filtered_headers, error = filter_json_body(
         body, headers, filtered_headers, max_body_bytes=backend.MAX_BODY_BYTES,
@@ -410,6 +418,8 @@ def register_chat_conversion(
         headers = backend._filter_headers(
             dict(request.headers), fallback_keys=(provider.upper() + "_API_KEY",), agentrouter_compat=False,
         )
+        if provider == "xingchi":
+            headers = prepare_client_headers(headers)
         headers["content-type"] = "application/json"
         body = json.dumps(chat_proxy.build_responses_payload(payload), ensure_ascii=False).encode("utf-8")
         params = request.query_params.multi_items()
@@ -417,16 +427,26 @@ def register_chat_conversion(
             # The translated JSON body is newly built and is not content-encoded.
             headers.pop("content-encoding", None)
             headers, body, params, filter_error = prepare_session_filtered_request(
-                headers, body, params, backend=backend,
+                headers, body, params, backend=backend, rotate_session=False,
             )
             if filter_error is not None:
                 return filter_error
         response = None
         try:
+            if provider == "xingchi" and XINGCHI_SESSION_FILTER_MODE == 2:
+                body, context_error = await xingchi_context.compact_request(
+                    backend, request, url=(upstream() if callable(upstream) else upstream) + endpoint_path,
+                    headers=headers, body=body, params=params,
+                    prepare_headers=lambda: filter_headers(headers, mode=2),
+                )
+                if context_error is not None:
+                    return context_error
             response = await backend._send_with_transport_retry(
                 backend.get_shared_client(), method="POST", url=(upstream() if callable(upstream) else upstream) + endpoint_path,
                 headers=headers, content=body, params=params,
                 stream=bool(payload.get("stream")), max_retries=2, request=request,
+                **({"prepare_headers": lambda: filter_headers(headers, mode=2)}
+                   if provider == "xingchi" and XINGCHI_SESSION_FILTER_MODE == 2 else {}),
             )
             response_headers = backend._clean_response_headers(response.headers)
             if response.is_success and "text/event-stream" in response.headers.get("content-type", "").lower():
@@ -467,7 +487,7 @@ def register_chat_conversion(
 def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstream=None,
                     prefix: str = XINGCHI_PREFIX, path_mapper=xingchi_upstream_path) -> None:
     """Install the same native relay on both proxy applications."""
-    label = {"freegg": "FreeGG", "omniai": "OmniAi"}.get(provider, "Xingchi")
+    label = PROVIDER_LABELS[provider]
     logger = _ProviderLogger(logging.getLogger("xingchi-proxy"), {"label": label})
     if provider == "xingchi":
         register_chat_conversion(app, backend, prefix=prefix, upstream=upstream or UPSTREAM, provider=provider)
@@ -481,11 +501,13 @@ def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstrea
         headers = backend._filter_headers(
             dict(request.headers), fallback_keys=(provider.upper() + "_API_KEY",), agentrouter_compat=False,
         )
+        if provider == "xingchi":
+            headers = prepare_client_headers(headers)
         body = await request.body()
         params = request.query_params.multi_items()
         if provider == "xingchi":
             headers, body, params, filter_error = prepare_session_filtered_request(
-                headers, body, params, backend=backend,
+                headers, body, params, backend=backend, rotate_session=False,
             )
             if filter_error is not None:
                 return filter_error
@@ -493,6 +515,15 @@ def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstrea
         retries = 0
         recovery_deadline = None
         try:
+            if (provider == "xingchi" and XINGCHI_SESSION_FILTER_MODE == 2
+                    and request.method == "POST" and upstream_path.endswith("/responses")):
+                body, context_error = await xingchi_context.compact_request(
+                    backend, request, url=(upstream() if upstream else UPSTREAM) + upstream_path,
+                    headers=headers, body=body, params=params,
+                    prepare_headers=lambda: filter_headers(headers, mode=2),
+                )
+                if context_error is not None:
+                    return context_error
             while True:
                 # A prior 429 is already closed. Never reuse it as this attempt's
                 # response if sending fails, and never retry the relay iterator.
@@ -502,6 +533,8 @@ def register_routes(app: FastAPI, backend, *, provider: str = "xingchi", upstrea
                         backend.get_shared_client(), method=request.method, url=(upstream() if upstream else UPSTREAM) + upstream_path,
                         headers=headers, content=body, params=params,
                         stream=True, max_retries=1, request=request,
+                        **({"prepare_headers": lambda: filter_headers(headers, mode=2)}
+                           if provider == "xingchi" and XINGCHI_SESSION_FILTER_MODE == 2 else {}),
                     )
                 except backend.RETRYABLE_TRANSPORT_ERRORS as exc:
                     diagnostic = backend.describe_exception(exc)

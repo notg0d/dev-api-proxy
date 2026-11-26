@@ -20,10 +20,11 @@ class ModelCatalogTests(unittest.TestCase):
         ]}
         original = copy.deepcopy(source)
         catalog = build_provider_catalog(source)
-        self.assertEqual(len(catalog["models"]), 8)
+        self.assertEqual(len(catalog["models"]), 10)
         self.assertEqual(source, original)
-        self.assertEqual([item["priority"] for item in catalog["models"]], list(range(8)))
-        for provider, label, offset in (("xingchi", "Xingchi", 0), ("omniai", "OmniAi", 2), ("freegg", "FreeGG", 4)):
+        self.assertEqual([item["priority"] for item in catalog["models"]], list(range(10)))
+        for provider, label, offset in (("xingchi", "Xingchi", 0), ("omniai", "OmniAi", 2),
+                                        ("freegg", "FreeGG", 4), ("moyuu", "Moyuu", 6)):
             first = catalog["models"][offset]
             self.assertEqual(split_model_alias(first["slug"]), (provider, "gpt-test"))
             self.assertEqual(first["display_name"], label + " · GPT Test")
@@ -31,7 +32,7 @@ class ModelCatalogTests(unittest.TestCase):
             self.assertEqual(first["context_window"], 1000000)
             self.assertEqual(first["comp_hash"], provider + "/source-cache-hash")
             self.assertEqual(catalog["models"][offset + 1]["supported_reasoning_levels"], original["models"][1]["supported_reasoning_levels"])
-        for old, compatibility in zip(original["models"], catalog["models"][6:]):
+        for old, compatibility in zip(original["models"], catalog["models"][8:]):
             self.assertEqual(compatibility["slug"], old["slug"])
             self.assertEqual(compatibility["visibility"], "hide")
             self.assertEqual(compatibility.get("model_messages"), old.get("model_messages"))

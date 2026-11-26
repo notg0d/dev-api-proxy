@@ -59,7 +59,8 @@ class DocumentationTests(unittest.TestCase):
     def test_opencode_example_has_separate_provider_routes_and_no_literal_keys(self):
         text = (ROOT / "examples/opencode.jsonc").read_text(encoding="utf-8")
         config = json.loads(re.sub(r"(?m)^\s*//.*$", "", text))
-        expected = {"Xingchi": "xingchi", "OmniAi": "omniai", "FreeGG": "freegg", "FreeGG-Anthropic": "freegg"}
+        expected = {"Xingchi": "xingchi", "OmniAi": "omniai", "FreeGG": "freegg",
+                    "FreeGG-Anthropic": "freegg", "Moyuu": "moyuu"}
         for provider, route in expected.items():
             definition = config["providers"][provider]
             self.assertEqual(definition["settings"]["baseURL"], "http://127.0.0.1:8789/" + route + "/v1")
@@ -69,7 +70,7 @@ class DocumentationTests(unittest.TestCase):
     @unittest.skipIf(tomllib is None, "Standard-library TOML validation requires Python 3.11+")
     def test_codex_examples_have_distinct_auth_sources(self):
         config = tomllib.loads((ROOT / "examples/codex.toml").read_text(encoding="utf-8"))
-        for provider in ("xingchi", "omniai", "freegg"):
+        for provider in ("xingchi", "omniai", "freegg", "moyuu"):
             definition = config["model_providers"][provider]
             self.assertEqual(definition["env_key"], provider.upper() + "_API_KEY")
             self.assertNotIn("experimental_bearer_token", definition)

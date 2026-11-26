@@ -29,3 +29,12 @@ env_key = "FREEGG_API_KEY"
 requires_openai_auth = false
 supports_websockets = false
 env_http_headers = { "X-Proxy-Token" = "PROXY_AUTH_TOKEN" }
+
+[model_providers.moyuu]
+name = "Moyuu (local proxy)"
+base_url = "http://127.0.0.1:8789/moyuu/v1"
+wire_api = "responses"
+env_key = "MOYUU_API_KEY"
+requires_openai_auth = false
+supports_websockets = false
+env_http_headers = { "X-Proxy-Token" = "PROXY_AUTH_TOKEN" }

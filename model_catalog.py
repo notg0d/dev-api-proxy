@@ -32,7 +32,7 @@ def build_provider_catalog(source: dict) -> dict:
     for provider, label in PROVIDER_LABELS.items():
         for model in models:
             item = copy.deepcopy(model)
-            name = re.sub(r"\s*\((?:Xingchi|OmniAi|FreeGG)\)\s*$", "", item.get("display_name") or item["slug"])
+            name = re.sub(r"\s*\((?:" + "|".join(PROVIDER_LABELS.values()) + r")\)\s*$", "", item.get("display_name") or item["slug"])
             item["slug"] = provider + "/" + model["slug"]
             item["display_name"] = label + " · " + name
             item["description"] = f"{label} through the local proxy. Model access depends on the provider account."

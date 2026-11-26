@@ -290,7 +290,7 @@ $ErrorActionPreference = 'Stop'
 # ---------------------------------------------------------------------------
 # 4. Load user-scoped provider credentials when the process has none.
 # ---------------------------------------------------------------------------
-foreach ($name in @('CODEX_GATEWAY_API_KEY', 'AGENTROUTER_API_KEY', 'XINGCHI_API_KEY', 'OMNIAI_API_KEY', 'FREEGG_API_KEY')) {
+foreach ($name in @('CODEX_GATEWAY_API_KEY', 'AGENTROUTER_API_KEY', 'XINGCHI_API_KEY', 'OMNIAI_API_KEY', 'FREEGG_API_KEY', 'MOYUU_API_KEY')) {
     $val = [Environment]::GetEnvironmentVariable($name)
     if ([string]::IsNullOrWhiteSpace($val)) {
         $val = [Environment]::GetEnvironmentVariable($name, 'User')

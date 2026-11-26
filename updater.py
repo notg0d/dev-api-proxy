@@ -26,8 +26,8 @@ from typing import Any, Iterable, Optional
 _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 _CORE_PYTHON_FILES = (
-    "version.py", "proxy.py", "chat_proxy.py", "request_guard.py", "xingchi_proxy.py",
-    "freegg_proxy.py", "omniai_proxy.py", "provider_routing.py", "startup_status.py",
+    "version.py", "proxy.py", "chat_proxy.py", "request_guard.py", "xingchi_proxy.py", "xingchi_context.py",
+    "freegg_proxy.py", "omniai_proxy.py", "moyuu_proxy.py", "provider_routing.py", "startup_status.py",
     "model_catalog.py", "service.py", "updater.py",
 )
 

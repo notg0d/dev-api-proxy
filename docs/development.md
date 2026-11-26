@@ -13,8 +13,10 @@ Do not use real provider keys or paid model requests for automated tests.
 | `request_guard.py` | Route/method allowlist, local authentication, and bounded uploads |
 | `provider_routing.py` | Provider-qualified model dispatch and cross-provider credential isolation |
 | `xingchi_proxy.py` | Native relay implementation, provider Chat conversion, and optional Xingchi filtering |
+| `xingchi_context.py` | Bounded Xingchi history summaries, stream validation, and credential-scoped summary cache |
 | `omniai_proxy.py` | OmniAi registration, upstream setting, and compatibility facade |
 | `freegg_proxy.py` | FreeGG registration and upstream setting |
+| `moyuu_proxy.py` | Moyuu registration and upstream setting |
 | `model_catalog.py` | Provider-labelled catalog generator with hidden compatibility entries |
 | `startup_status.py` | Shared credential-safe startup formatter |
 | `service.py` | Headless supervision, rotating logs, and update loop |
@@ -85,8 +87,8 @@ For example, after an approved release commit and tag exist:
 
 ```powershell
 git push origin main
-git push origin v1.8.0
-gh release create v1.8.0 --verify-tag --title "dev-api-proxy v1.8.0" --notes-file docs/releases/v1.8.0.md
+git push origin v1.9.0
+gh release create v1.9.0 --verify-tag --title "dev-api-proxy v1.9.0" --notes-file docs/releases/v1.9.0.md
 ```
 
 These commands publish work. Do not run them without release authorization.

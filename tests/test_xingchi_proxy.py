@@ -43,6 +43,15 @@ class ByteStream(httpx.AsyncByteStream):
 
 
 class XingchiRouteTests(unittest.TestCase):
+    def test_client_user_agent_override_is_optional_and_case_insensitive(self):
+        original = {"User-Agent": "caller-client", "authorization": "Bearer fixture-key"}
+        with patch.object(xingchi_proxy, "USER_AGENT", ""):
+            self.assertEqual(xingchi_proxy.prepare_client_headers(original), original)
+        with patch.object(xingchi_proxy, "USER_AGENT", "opencode/2.4.2"):
+            prepared = xingchi_proxy.prepare_client_headers(original)
+        self.assertEqual(prepared, {"user-agent": "opencode/2.4.2", "authorization": "Bearer fixture-key"})
+        self.assertEqual(original["User-Agent"], "caller-client")
+
     def test_startup_status_shows_every_upstream_and_filter_mode(self):
         output = io.StringIO()
         with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 2), redirect_stdout(output):
@@ -59,7 +68,7 @@ class XingchiRouteTests(unittest.TestCase):
         self.assertEqual(xingchi_proxy.session_filter_status(1), "metadata filtering (mode 1)")
         self.assertEqual(
             xingchi_proxy.session_filter_status(2),
-            "metadata filtering; session rotation every 88 requests (mode 2)",
+            "metadata filtering; session rotation every 88 requests (mode 2); history summaries at 88 model turns",
         )
 
     def test_explicit_routes_and_methods(self):
@@ -124,13 +133,13 @@ class XingchiRouteTests(unittest.TestCase):
     def test_rotation_replaces_ids_on_request_88_and_keeps_aliases_in_sync(self):
         xingchi_proxy.reset_session_filter_state()
         self.addCleanup(xingchi_proxy.reset_session_filter_state)
-        with patch.object(xingchi_proxy.secrets, "token_hex", return_value="rotated-session"):
+        with patch.object(xingchi_proxy.secrets, "token_hex", side_effect=["initial-session", "rotated-session"]):
             for _ in range(xingchi_proxy.SESSION_ROTATE_AFTER - 1):
                 headers = xingchi_proxy.filter_headers({
                     "x-session-id": "original-session", "session_id": "original-session",
                     "x-client-request-id": "remove",
                 }, mode=2)
-                self.assertEqual(headers["x-session-id"], "original-session")
+                self.assertEqual(headers["x-session-id"], "initial-session")
             rotated = xingchi_proxy.filter_headers({
                 "x-session-id": "original-session", "session_id": "original-session",
                 "x-client-request-id": "remove",
@@ -140,6 +149,67 @@ class XingchiRouteTests(unittest.TestCase):
             self.assertNotIn("x-client-request-id", rotated)
             continued = xingchi_proxy.filter_headers({"x-session-id": "original-session"}, mode=2)
             self.assertEqual(continued["x-session-id"], "rotated-session")
+
+    def test_mode_2_assigns_an_explicit_session_without_client_headers(self):
+        xingchi_proxy.reset_session_filter_state()
+        self.addCleanup(xingchi_proxy.reset_session_filter_state)
+        with patch.object(xingchi_proxy.secrets, "token_hex", side_effect=["first", "second"]):
+            first = xingchi_proxy.filter_headers({"authorization": "Bearer first-key"}, mode=2)
+            repeated = xingchi_proxy.filter_headers({"authorization": "Bearer first-key"}, mode=2)
+            other = xingchi_proxy.filter_headers({"authorization": "Bearer second-key"}, mode=2)
+        self.assertEqual(first["session_id"], "first")
+        self.assertEqual(repeated["session_id"], "first")
+        self.assertEqual(other["session_id"], "second")
+
+    def test_mode_2_recognizes_opencode_and_normalized_session_aliases(self):
+        for name in ("x-opencode-session", "sessionid", "codex_session", "X-Codex-Thread-Id", "Thread_Id"):
+            with self.subTest(name=name):
+                xingchi_proxy.reset_session_filter_state()
+                with patch.object(xingchi_proxy.secrets, "token_hex", side_effect=["first", "second"]):
+                    first = xingchi_proxy.filter_headers({name: "client-first"}, mode=2)
+                    repeated = xingchi_proxy.filter_headers({name: "client-first"}, mode=2)
+                    other = xingchi_proxy.filter_headers({name: "client-second"}, mode=2)
+                self.assertEqual(first["session_id"], "first")
+                self.assertEqual(repeated["session_id"], "first")
+                self.assertEqual(other["session_id"], "second")
+        xingchi_proxy.reset_session_filter_state()
+
+    def test_mode_2_starts_a_fresh_upstream_session_after_restart(self):
+        xingchi_proxy.reset_session_filter_state()
+        self.addCleanup(xingchi_proxy.reset_session_filter_state)
+        with patch.object(xingchi_proxy.secrets, "token_hex", side_effect=["before-restart", "after-restart"]):
+            before = xingchi_proxy.filter_headers({"session_id": "client-session"}, mode=2)
+            xingchi_proxy.reset_session_filter_state()
+            after = xingchi_proxy.filter_headers({"session_id": "client-session"}, mode=2)
+        self.assertEqual(before["session_id"], "before-restart")
+        self.assertEqual(after["session_id"], "after-restart")
+
+    def test_mode_2_isolates_reused_client_ids_by_credentials(self):
+        xingchi_proxy.reset_session_filter_state()
+        self.addCleanup(xingchi_proxy.reset_session_filter_state)
+        with patch.object(xingchi_proxy.secrets, "token_hex", side_effect=["first", "second"]):
+            first = xingchi_proxy.filter_headers({"session_id": "same", "x-api-key": "first-key"}, mode=2)
+            other = xingchi_proxy.filter_headers({"session_id": "same", "x-api-key": "second-key"}, mode=2)
+        self.assertNotEqual(first["session_id"], other["session_id"])
+
+    def test_mode_2_respects_custom_header_exclusions(self):
+        xingchi_proxy.reset_session_filter_state()
+        self.addCleanup(xingchi_proxy.reset_session_filter_state)
+        with patch.object(xingchi_proxy, "_CUSTOM_FILTER_NAMES", frozenset({"sessionid"})):
+            headers = xingchi_proxy.filter_headers({"session_id": "excluded"}, mode=2)
+        self.assertEqual(headers, {})
+
+    def test_mode_2_counts_every_request_across_multiple_rotations(self):
+        xingchi_proxy.reset_session_filter_state()
+        self.addCleanup(xingchi_proxy.reset_session_filter_state)
+        counts = {}
+        for _ in range(350):
+            headers = xingchi_proxy.filter_headers({"session_id": "client-session"}, mode=2)
+            active = headers["session_id"]
+            self.assertNotEqual(active, "client-session")
+            counts[active] = counts.get(active, 0) + 1
+        self.assertGreater(len(counts), 3)
+        self.assertLessEqual(max(counts.values()), xingchi_proxy.SESSION_ROTATE_AFTER)
 
 
 class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
@@ -239,6 +309,45 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("originator", self.calls[-1].headers)
             self.assertEqual(json.loads(self.calls[-1].content)["input"][0]["content"], "hi")
 
+    async def test_client_user_agent_override_covers_native_and_converted_routes(self):
+        completion = {"id": "resp-agent", "model": "test", "status": "completed", "output": []}
+        routes = ("/xingchi/v1/responses", "/xingchi/codex/v1/responses",
+                  "/xingchi/v1/chat/completions", "/xingchi/codex/v1/chat/completions")
+        with patch.object(xingchi_proxy, "USER_AGENT", "opencode/2.4.2"):
+            for app in (proxy.app, chat_proxy.app):
+                for path in routes:
+                    with self.subTest(app=app.title, path=path):
+                        self.script.append(httpx.Response(200, json=completion))
+                        field = "messages" if path.endswith("/chat/completions") else "input"
+                        async with self.client(app) as client:
+                            result = await client.post(path, json={
+                                "model": "test", field: [{"role": "user", "content": "hi"}],
+                            }, headers={"authorization": "Bearer fixture-key", "user-agent": "python-httpx"})
+                        self.assertEqual(result.status_code, 200)
+                        self.assertEqual(self.calls[-1].headers["user-agent"], "opencode/2.4.2")
+                        self.assertEqual(self.calls[-1].headers["authorization"], "Bearer fixture-key")
+                        self.assertNotIn("originator", self.calls[-1].headers)
+
+    async def test_client_user_agent_override_is_isolated_to_xingchi(self):
+        with patch.object(xingchi_proxy, "USER_AGENT", "opencode/2.4.2"):
+            async with self.client(chat_proxy.app) as client:
+                for prefix in ("omniai", "freegg", "moyuu"):
+                    with self.subTest(provider=prefix):
+                        self.script.append(httpx.Response(200, json={"data": []}))
+                        result = await client.get(f"/{prefix}/v1/models", headers={"user-agent": "original-client"})
+                        self.assertEqual(result.status_code, 200)
+                        self.assertEqual(self.calls[-1].headers["user-agent"], "original-client")
+
+    async def test_client_user_agent_override_preserves_permission_errors(self):
+        rejection = {"error": {"code": "permission_denied", "message": "Model access denied"}}
+        self.script.append(httpx.Response(403, json=rejection))
+        with patch.object(xingchi_proxy, "USER_AGENT", "opencode/2.4.2"):
+            async with self.client(chat_proxy.app) as client:
+                result = await client.post("/xingchi/v1/responses", json={"model": "test", "input": "hi"})
+        self.assertEqual(result.status_code, 403)
+        self.assertEqual(result.json(), rejection)
+        self.assertEqual(len(self.calls), 1)
+
     async def test_fallback_credentials_are_isolated_and_native_headers_win(self):
         with patch.dict(os.environ, {"CODEX_GATEWAY_API_KEY": "agent-only", "AGENTROUTER_API_KEY": "agent-other"}):
             async with self.client(chat_proxy.app) as client:
@@ -320,6 +429,69 @@ class XingchiRelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent.headers["x-session-id"], "rotated-session")
         self.assertEqual(sent.headers["session_id"], "rotated-session")
         self.assertNotIn("x-client-request-id", sent.headers)
+
+    async def test_mode_2_without_headers_sends_rotating_ids_past_100_requests(self):
+        body = {"model": "test", "input": "hi", "prompt_cache_key": "client-session"}
+        for app in (proxy.app, chat_proxy.app):
+            xingchi_proxy.reset_session_filter_state()
+            start = len(self.calls)
+            self.script.extend(httpx.Response(200, json={"ok": True}) for _ in range(205))
+            with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 2):
+                async with self.client(app) as client:
+                    for _ in range(205):
+                        result = await client.post("/xingchi/responses", json=body)
+                        self.assertEqual(result.status_code, 200)
+            counts = {}
+            for sent in self.calls[start:]:
+                active = sent.headers["session_id"]
+                self.assertNotEqual(active, "client-session")
+                self.assertNotIn("prompt_cache_key", json.loads(sent.content))
+                counts[active] = counts.get(active, 0) + 1
+            self.assertGreaterEqual(len(counts), 3)
+            self.assertLess(max(counts.values()), 100)
+        xingchi_proxy.reset_session_filter_state()
+
+    async def test_mode_2_counts_native_http_and_transport_retry_attempts(self):
+        for app in (proxy.app, chat_proxy.app):
+            for failure in (httpx.Response(503, json={"error": {"message": "temporarily unavailable"}}),
+                            httpx.ReadError("connection reset")):
+                xingchi_proxy.reset_session_filter_state()
+                start = len(self.calls)
+                self.script.extend([failure, httpx.Response(200, json={"ok": True}),
+                                    httpx.Response(200, json={"ok": True})])
+                with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 2), \
+                        patch.object(xingchi_proxy, "SESSION_ROTATE_AFTER", 3), \
+                        patch.object(xingchi_proxy.secrets, "token_hex", side_effect=["first", "rotated"]), \
+                        patch.object(xingchi_proxy, "_wait_retry", new_callable=AsyncMock):
+                    async with self.client(app) as client:
+                        for _ in range(2):
+                            result = await client.post("/xingchi/responses", json={"input": "hi"},
+                                                       headers={"x-opencode-session": "original"})
+                            self.assertEqual(result.status_code, 200)
+                self.assertEqual([sent.headers["session_id"] for sent in self.calls[start:]],
+                                 ["first", "first", "rotated"])
+        xingchi_proxy.reset_session_filter_state()
+
+    async def test_mode_2_counts_chat_conversion_transport_retry_attempts(self):
+        completion = {"id": "resp-1", "status": "completed", "output": []}
+        for app in (proxy.app, chat_proxy.app):
+            xingchi_proxy.reset_session_filter_state()
+            start = len(self.calls)
+            self.script.extend([httpx.ReadError("connection reset"), httpx.Response(200, json=completion),
+                                httpx.Response(200, json=completion)])
+            with patch.object(xingchi_proxy, "XINGCHI_SESSION_FILTER_MODE", 2), \
+                    patch.object(xingchi_proxy, "SESSION_ROTATE_AFTER", 3), \
+                    patch.object(xingchi_proxy.secrets, "token_hex", side_effect=["first", "rotated"]), \
+                    patch.object(proxy, "_sleep_unless_disconnected", new_callable=AsyncMock, return_value=True):
+                async with self.client(app) as client:
+                    for _ in range(2):
+                        result = await client.post("/xingchi/v1/chat/completions", json={
+                            "model": "test", "messages": [{"role": "user", "content": "hi"}],
+                        })
+                        self.assertEqual(result.status_code, 200)
+            self.assertEqual([sent.headers["session_id"] for sent in self.calls[start:]],
+                             ["first", "first", "rotated"])
+        xingchi_proxy.reset_session_filter_state()
 
     async def test_filter_decodes_compressed_json_before_forwarding(self):
         original = b'{"model":"test","client_metadata":{"session_id":"remove"},"input":"hi"}'

@@ -28,15 +28,24 @@ Configure client credentials separately or use proxy-side fallbacks for provider
 | `AGENTROUTER_API_KEY` | Empty | Second primary fallback key |
 | `XINGCHI_UPSTREAM` | `https://api.xingchiapi.com` | Xingchi server; optional trailing `/v1` is normalized |
 | `XINGCHI_API_KEY` | Empty | Xingchi fallback only |
+| `XINGCHI_USER_AGENT` | Empty | Optional Xingchi-only `User-Agent` override; empty preserves the caller's value |
 | `OMNIAI_UPSTREAM` | `https://sub.omniai.cc` | OmniAi server; optional trailing `/v1` is normalized |
 | `OMNIAI_API_KEY` | Empty | OmniAi fallback only |
 | `FREEGG_UPSTREAM` | `https://freegg.app` | FreeGG server; optional trailing `/v1` is normalized |
 | `FREEGG_API_KEY` | Empty | FreeGG fallback only |
+| `MOYUU_UPSTREAM` | `https://moyuu.cc` | Moyuu server; optional trailing `/v1` is normalized |
+| `MOYUU_API_KEY` | Empty | Moyuu fallback only |
 | `PROXY_AUTH_TOKEN` | Empty | Separate local access token; required on non-loopback startup |
 
 Native server settings must be HTTP(S) origins, with optional `/v1`.
 Credentials, query strings, fragments, and other path prefixes are rejected there.
 Keep API keys out of URLs.
+
+If Xingchi returns `403 client_not_allowed`, set `XINGCHI_USER_AGENT` to the client identifier for your integration.
+For OpenCode, use a versioned identifier such as `XINGCHI_USER_AGENT=opencode/2.4.2`.
+The override applies to native Xingchi routes, converted Chat requests, and history summary requests.
+Other providers keep their original client headers. Authentication and model permissions still apply.
+Restart the proxy service after changing this setting so its workers inherit the new value.
 
 ## Listener and upload limits
 
@@ -70,12 +79,15 @@ The PowerShell launcher's default ports are selected by mode; pass `-Port` for a
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `XINGCHI_SESSION_FILTER_MODE` | `0` | `0`: disabled; `1`: metadata filtering; `2`: filtering plus session-header rotation |
+| `XINGCHI_SESSION_FILTER_MODE` | `0` | `0`: disabled; `1`: metadata filtering; `2`: filtering, session-header rotation, and history summaries |
 | `XINGCHI_SESSION_FILTER_NAMES` | Empty | Comma-separated extra names to remove |
 
 The mode must be `0`, `1`, or `2`.
-The rotation threshold is `88` incoming requests for recognized session headers.
-State and counters are in memory, per process.
+Session IDs rotate at `88` sends, including retry attempts.
+Mode `2` also summarizes older Responses history at `88` model turns, before Xingchi's 100-turn payload limit.
+Older prefixes use bounded summary chunks. Each uncached chunk needs an additional model request.
+Unchanged prefixes can reuse cached summaries. Summaries can omit older details.
+State, counters, and summaries are in memory, per process.
 Do not add required request fields or authentication headers to the extra-name list.
 See [filter semantics](providers.md#xingchi-session-filtering).
 

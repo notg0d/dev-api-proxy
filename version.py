@@ -1,3 +1,3 @@
 """Release version shared by both proxy applications."""
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"

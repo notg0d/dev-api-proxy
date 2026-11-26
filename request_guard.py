@@ -27,7 +27,8 @@ POST_PATHS = frozenset({
 XINGCHI_PREFIX = "/xingchi"
 FREEGG_PREFIX = "/freegg"
 OMNIAI_PREFIX = "/omniai"
-FREEGG_POST_PATHS = frozenset({
+MOYUU_PREFIX = "/moyuu"
+NEWAPI_POST_PATHS = frozenset({
     "/v1/responses", "/v1/responses/compact", "/v1/chat/completions", "/v1/completions",
     "/v1/messages", "/v1/embeddings", "/v1/moderations", "/v1/rerank",
     "/v1/images/generations", "/v1/images/edits", "/v1/edits",
@@ -37,17 +38,26 @@ FREEGG_POST_PATHS = frozenset({
 
 def freegg_upstream_path(path: str) -> str:
     """Map the isolated FreeGG namespace to native New API routes."""
-    if not path.startswith(FREEGG_PREFIX + "/"):
+    return _newapi_upstream_path(path, FREEGG_PREFIX)
+
+
+def moyuu_upstream_path(path: str) -> str:
+    """Map the isolated Moyuu namespace to native New API routes."""
+    return _newapi_upstream_path(path, MOYUU_PREFIX)
+
+
+def _newapi_upstream_path(path: str, prefix: str) -> str:
+    if not path.startswith(prefix + "/"):
         return ""
-    path = path[len(FREEGG_PREFIX):]
+    path = path[len(prefix):]
     return path if path.startswith(("/v1/", "/v1beta/")) else "/v1" + path
 
 
-def _freegg_allowed_methods(path: str) -> frozenset[str]:
-    path = freegg_upstream_path(path)
+def _newapi_allowed_methods(path: str, prefix: str) -> frozenset[str]:
+    path = _newapi_upstream_path(path, prefix)
     if path in ("/v1/models", "/v1beta/models", "/v1beta/openai/models"):
         return frozenset({"GET"})
-    if path in FREEGG_POST_PATHS:
+    if path in NEWAPI_POST_PATHS:
         return frozenset({"POST"})
     if path.startswith("/v1/models/") and _XINGCHI_MODEL_RE.fullmatch(path[len("/v1/models/"):]):
         return frozenset({"GET"})
@@ -138,7 +148,9 @@ def allowed_methods(path: str) -> frozenset[str]:
     if path.startswith(OMNIAI_PREFIX + "/"):
         return _sub2api_allowed_methods(path, OMNIAI_PREFIX)
     if path.startswith(FREEGG_PREFIX + "/"):
-        return _freegg_allowed_methods(path)
+        return _newapi_allowed_methods(path, FREEGG_PREFIX)
+    if path.startswith(MOYUU_PREFIX + "/"):
+        return _newapi_allowed_methods(path, MOYUU_PREFIX)
     if path.startswith(XINGCHI_PREFIX + "/"):
         return _xingchi_allowed_methods(path)
     if path in ("/_health", "/_stats", "/v1/models", "/models"):

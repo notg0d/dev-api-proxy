@@ -68,6 +68,20 @@
       "models": {
         "claude-opus-5": { "name": "FreeGG · Claude Opus 5" }
       }
+    },
+    "Moyuu": {
+      "name": "Moyuu (local proxy)",
+      "package": "@opencode/ai/providers/openai-compatible/responses",
+      "env": ["MOYUU_API_KEY"],
+      "settings": {
+        "baseURL": "http://127.0.0.1:8789/moyuu/v1",
+        "transport": "http",
+        "encoding": "none"
+      },
+      "headers": { "X-Proxy-Token": "{env:PROXY_AUTH_TOKEN}" },
+      "models": {
+        "gpt-6.1-sol": { "name": "Moyuu · GPT-6.1 Sol" }
+      }
     }
   }
 }

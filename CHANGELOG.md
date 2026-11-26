@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.9.0 - 2026-11-26
+
+### Added
+
+- Native Moyuu routes under `/moyuu`, with an isolated `MOYUU_API_KEY` fallback and `MOYUU_UPSTREAM` setting.
+- Moyuu picker aliases such as `moyuu/gpt-6.1-sol`, catalog labels, and a provider-specific compaction fingerprint.
+- Moyuu OpenCode and Codex examples, configuration rows, and provider notes recording public route probes.
+- Automatic Xingchi history summaries in mode `2`, before the 100-turn payload limit.
+- Optional `XINGCHI_USER_AGENT` override for native, converted Chat, and history summary requests.
+
+### Improved
+
+- FreeGG and Moyuu share one New API route allowlist instead of separate copies.
+- Relay labels and generated catalog labels read from the single provider registry.
+- Startup output, health, key redaction, launcher credential loading, and the updater module set include Moyuu.
+- Xingchi session rotation counts every upstream send, including summaries and retry attempts.
+- Session aliases include OpenCode and normalized Codex headers, with counters isolated by upstream credentials.
+
+### Fixed
+
+- Summary requests use bounded chunks instead of sending an oversized history back to the same 100-turn guard.
+- Streaming metadata has a separate 16 MiB response limit from the 256 KiB summary-text limit.
+- Empty, failed, incomplete, oversized, and turn-limit notice summaries are rejected instead of replacing history.
+- The updater compiles `xingchi_context.py` before an update becomes active.
+
+### Upgrade notes
+
+Both modes now report `1.9.0`. Restart the proxy service so workers load all new modules and settings.
+Preserve `.env`; add `MOYUU_API_KEY` only when you want a proxy-side Moyuu fallback.
+Moyuu Chat Completions are converted to Responses, matching the existing New API policy.
+Regenerate a provider-labelled catalog to add Moyuu picker entries; existing model IDs stay valid.
+Moyuu responses input-token counts, Anthropic token counts, and Gemini `countTokens` are not exposed.
+
+Xingchi history summaries require `XINGCHI_SESSION_FILTER_MODE=2`; the default remains `0`.
+Each uncached summary chunk uses an additional model request. Summaries can omit older details.
+For `403 client_not_allowed`, configure a versioned client identifier, such as `XINGCHI_USER_AGENT=opencode/2.4.2`.
+Keep valid provider credentials; the header override does not change account or model permissions.
+
 ## 1.8.0 - 2026-11-22
 
 ### Added

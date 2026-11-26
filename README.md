@@ -1,20 +1,20 @@
 # dev-api-proxy
 
 `dev-api-proxy` is a local API gateway for OpenCode, ChatGPT desktop, Codex, and compatible AI clients.
-It provides primary-upstream recovery and separate Xingchi, OmniAi, and FreeGG routes.
+It provides primary-upstream recovery and separate Xingchi, OmniAi, FreeGG, and Moyuu routes.
 The default primary upstream is AgentRouter. You can use another compatible server.
 
-**Current release: [v1.8.0](https://github.com/notg0d/dev-api-proxy/releases/tag/v1.8.0).**
+**Current release: [v1.9.0](https://github.com/notg0d/dev-api-proxy/releases/tag/v1.9.0).**
 Both proxy modes report this version in `/_health`.
 
 ## What it does
 
 - Accepts Responses requests and, in combined mode, primary Chat Completions requests.
-- Converts primary, Xingchi, and FreeGG Chat Completions requests to Responses.
+- Converts primary, Xingchi, FreeGG, and Moyuu Chat Completions requests to Responses.
 - Relays OmniAi Chat Completions without conversion.
 - Keeps each native provider's routes, keys, formats, and retry state separate.
 - Adds provider-labelled models to the ChatGPT desktop model picker through a generated catalog.
-- Supports optional Xingchi session filtering and 88-request session-header rotation.
+- Supports optional Xingchi session filtering, session-header rotation, and history summaries.
 - Applies local authentication, upload limits, SSE limits, and disconnect cancellation.
 - Shows one startup summary with all configured providers and active settings.
 
@@ -93,6 +93,7 @@ Unknown routes return `404`. Incorrect methods return `405`.
 | Xingchi | `http://127.0.0.1:8789/xingchi/v1` | `https://api.xingchiapi.com` |
 | OmniAi | `http://127.0.0.1:8789/omniai/v1` | `https://sub.omniai.cc` |
 | FreeGG | `http://127.0.0.1:8789/freegg/v1` | `https://freegg.app` |
+| Moyuu | `http://127.0.0.1:8789/moyuu/v1` | `https://moyuu.cc` |
 
 Use port `8788` with `proxy.py`.
 For Anthropic and Gemini clients, see [protocol-specific URLs](docs/providers.md#client-base-urls).
@@ -107,11 +108,25 @@ Set `XINGCHI_SESSION_FILTER_MODE` to:
 
 - `0`: disabled, the default.
 - `1`: remove session metadata from headers, query parameters, and JSON outside protected conversation fields.
-- `2`: filter metadata and rotate recognized session headers at the 88-request threshold.
+- `2`: filter metadata, rotate session headers at 88 sends, and summarize history at 88 model turns.
 
-Rotation state is in memory, per process. Retries reuse the prepared request.
-The filter does not shorten conversation history or increase provider quotas.
+Rotation state and summary caches are in memory, per process. Retry attempts count toward rotation.
+Mode `2` summarizes older context in forwarded Responses requests, including requests converted from Chat Completions.
+It retains recent turns and leaves the client's saved conversation unchanged.
+Summary requests use bounded chunks; unchanged prefixes reuse cached summaries.
+Each uncached chunk uses an additional model request. Summaries can omit older details.
+The proxy cannot increase provider quotas.
 See [Xingchi session filtering](docs/providers.md#xingchi-session-filtering).
+
+For `403 client_not_allowed`, set a versioned client identifier in `.env`, then restart the proxy service:
+
+```dotenv
+XINGCHI_USER_AGENT=opencode/2.4.2
+```
+
+Use the identifier for your client version. Empty preserves the caller's `User-Agent`.
+The override applies only to Xingchi, including summary requests. Provider credentials and model permissions still apply.
+See the [configuration reference](docs/configuration.md#providers-and-authentication).
 
 ### OmniAi routes
 
@@ -129,12 +144,20 @@ Native Anthropic, Gemini, image, audio, and other permitted routes remain availa
 Responses input-token counts and Anthropic token-count routes are not exposed for FreeGG.
 See [FreeGG routes](docs/providers.md#freegg).
 
+### Moyuu routes
+
+Moyuu has its own `/moyuu` namespace and `MOYUU_API_KEY` fallback.
+It runs New API and shares the FreeGG route allowlist and Chat conversion policy.
+Native Anthropic, Gemini, image, audio, and other permitted routes remain available.
+The Xingchi session filter does not apply to Moyuu.
+See [Moyuu support and verification](docs/providers.md#moyuu).
+
 ### Chat Completions conversion
 
 | Request path | Behavior |
 | --- | --- |
 | Primary Chat in combined mode | Convert to Responses and use primary recovery |
-| Xingchi or FreeGG Chat | Convert directly to that provider's Responses endpoint |
+| Xingchi, FreeGG, or Moyuu Chat | Convert directly to that provider's Responses endpoint |
 | OmniAi Chat | Native relay |
 | Xingchi or OmniAi Codex-facade Chat | Convert to `/backend-api/codex/responses` |
 
@@ -153,6 +176,7 @@ Without a client key, each native relay uses only its own configured fallback:
 XINGCHI_API_KEY=your-xingchi-key
 OMNIAI_API_KEY=your-omniai-key
 FREEGG_API_KEY=your-freegg-key
+MOYUU_API_KEY=your-moyuu-key
 ```
 
 Primary forwarding preserves `Authorization` and otherwise tries `CODEX_GATEWAY_API_KEY`, then `AGENTROUTER_API_KEY`.
@@ -195,6 +219,7 @@ ChatGPT desktop can use one gateway connection with provider-qualified model IDs
 | `Xingchi · GPT-6.1 Sol` | `xingchi/gpt-6.1-sol` | `gpt-6.1-sol` on Xingchi |
 | `OmniAi · GPT-6.1 Sol` | `omniai/gpt-6.1-sol` | `gpt-6.1-sol` on OmniAi |
 | `FreeGG · GPT-6.1 Sol` | `freegg/gpt-6.1-sol` | `gpt-6.1-sol` on FreeGG |
+| `Moyuu · GPT-6.1 Sol` | `moyuu/gpt-6.1-sol` | `gpt-6.1-sol` on Moyuu |
 
 The proxy routes these IDs to the selected provider. It does not merely relabel the models.
 Cross-provider choices use that provider's proxy-side key, never the original connection's key.
@@ -272,6 +297,7 @@ It does not expose key values. Review logs before sharing them; upstream errors 
 | Local `413` | Check `PROXY_MAX_BODY_BYTES` and request size |
 | Upstream `413` | Shorten history, reduce images, or compact client-side; the service controls its own limit |
 | `provider_api_key_missing` | Configure the selected provider's fallback key on the proxy |
+| `xingchi_context_compaction_failed` | Retry `/compact` or start a new session; the client's saved history remains unchanged |
 | New feature absent from health | Stop the old worker and restart it; the launcher can reuse an existing process |
 | Model absent or unauthorized | Check the client credential source and account model access |
 | Interrupted stream | Review the cause; delivered output is not replayed |
@@ -293,4 +319,4 @@ Wait for active requests to finish before stopping the proxy.
 Update a clean checkout, preserve `.env`, then restart the selected proxy mode.
 Restart ChatGPT desktop after changing its provider or catalog configuration.
 OpenCode watches configuration files; a config change alone does not require a service restart.
-See [v1.8.0 upgrade notes](CHANGELOG.md#180---2026-11-22).
+See [v1.9.0 upgrade notes](CHANGELOG.md#190---2026-11-26).

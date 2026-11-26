@@ -1,7 +1,7 @@
 """Local Responses gateway for OpenCode and other compatible clients.
 
 Primary requests use bounded recovery, supplied-history sanitization, and SSE
-inspection. Native Xingchi, OmniAi, and FreeGG relays retain their own policy.
+inspection. Native Xingchi, OmniAi, FreeGG, and Moyuu relays retain their own policy.
 The request guard and model-prefix router run before upstream work. Individual
 responses own connection cleanup; retries never replay committed output.
 See README.md and docs/ for setup, limits, credential rules, and validation.
@@ -204,6 +204,7 @@ _load_env()
 import xingchi_proxy
 import freegg_proxy
 import omniai_proxy
+import moyuu_proxy
 
 UPSTREAM = os.environ.get("AGENTROUTER_UPSTREAM", "https://agentrouter.org").rstrip("/")
 DEFAULT_LISTEN_HOST = "127.0.0.1"
@@ -791,6 +792,7 @@ def redact_sensitive(text: str) -> str:
         os.environ.get("XINGCHI_API_KEY"),
         os.environ.get("FREEGG_API_KEY"),
         os.environ.get("OMNIAI_API_KEY"),
+        os.environ.get("MOYUU_API_KEY"),
     ):
         if secret:
             text = text.replace(secret, "[redacted]")
@@ -968,6 +970,7 @@ async def _send_with_transport_retry(
     max_retries: int = 2,
     diagnostics: Optional[UpstreamAttemptDiagnostics] = None,
     request: Optional[Request] = None,
+    prepare_headers: Optional[Callable[[], Dict[str, str]]] = None,
 ) -> httpx.Response:
     """
     Send with bounded transport retries; callers can own the budget with max_retries=1.
@@ -980,7 +983,7 @@ async def _send_with_transport_retry(
             req = client.build_request(
                 method=method,
                 url=url,
-                headers=headers,
+                headers=prepare_headers() if prepare_headers is not None else headers,
                 params=params,
                 content=content,
                 extensions={"trace": attempt_diagnostics.trace},
@@ -1034,6 +1037,7 @@ def print_startup_summary(
         ("Xingchi", xingchi_proxy.UPSTREAM, "/xingchi/v1", bool(os.environ.get("XINGCHI_API_KEY"))),
         ("OmniAi", omniai_proxy.UPSTREAM, "/omniai/v1", bool(os.environ.get("OMNIAI_API_KEY"))),
         ("FreeGG", freegg_proxy.UPSTREAM, "/freegg/v1", bool(os.environ.get("FREEGG_API_KEY"))),
+        ("Moyuu", moyuu_proxy.UPSTREAM, "/moyuu/v1", bool(os.environ.get("MOYUU_API_KEY"))),
     )
     lines = build_summary(
         mode=mode, host=host or LISTEN_HOST, port=PORT if port is None else port, providers=providers,
@@ -1070,7 +1074,7 @@ async def _app_lifespan(_: FastAPI):
 
 app = FastAPI(
     title="dev-api-proxy",
-    description="Local Responses proxy for OpenCode with primary-upstream recovery and native Xingchi, FreeGG, and OmniAi routes",
+    description="Local Responses proxy for OpenCode with primary-upstream recovery and native Xingchi, FreeGG, OmniAi, and Moyuu routes",
     version=VERSION,
     lifespan=_app_lifespan,
 )
@@ -1122,13 +1126,14 @@ async def health():
         "dns_fallback_active": True,
         "max_images_per_request": MAX_IMAGES_PER_REQUEST,
         "xingchi_session_filter_mode": xingchi_proxy.XINGCHI_SESSION_FILTER_MODE,
+        "xingchi_context_compaction": xingchi_proxy.XINGCHI_SESSION_FILTER_MODE == 2,
         "provider_model_prefixes": list(PROVIDER_LABELS),
         "listen": f"{LISTEN_HOST}:{PORT}",
         "uptime_seconds": uptime_s,
         "upstream": UPSTREAM,
         "additional_upstreams": {
             "xingchi": xingchi_proxy.UPSTREAM, "freegg": freegg_proxy.UPSTREAM,
-            "omniai": omniai_proxy.UPSTREAM,
+            "omniai": omniai_proxy.UPSTREAM, "moyuu": moyuu_proxy.UPSTREAM,
         },
         "stats": STATS,
     }
@@ -2106,6 +2111,7 @@ async def recover_responses_request(
 xingchi_proxy.register_routes(app, sys.modules[__name__])
 freegg_proxy.register_routes(app, sys.modules[__name__])
 omniai_proxy.register_routes(app, sys.modules[__name__])
+moyuu_proxy.register_routes(app, sys.modules[__name__])
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])

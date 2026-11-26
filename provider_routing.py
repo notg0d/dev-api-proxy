@@ -9,7 +9,7 @@ from typing import Callable
 from request_guard import allowed_methods
 
 
-PROVIDER_LABELS = {"xingchi": "Xingchi", "omniai": "OmniAi", "freegg": "FreeGG"}
+PROVIDER_LABELS = {"xingchi": "Xingchi", "omniai": "OmniAi", "freegg": "FreeGG", "moyuu": "Moyuu"}
 MODEL_ROUTING_PATHS = frozenset({
     "/v1/responses", "/responses", "/v1/responses/compact", "/responses/compact",
     "/v1/responses/input_tokens", "/responses/input_tokens",
